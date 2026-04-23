@@ -1,0 +1,12 @@
+[package]
+authors = ["cilki"]
+description = "AI era test framework"
+edition = "2024"
+license = "Unlicense"
+name = "attest"
+version = "0.1.0"
+
+[dependencies]
+anyhow = "1.0.100"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
