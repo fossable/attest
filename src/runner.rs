@@ -159,25 +159,22 @@ fn fork_test(
                 cg.enter();
             }
 
-            // Build a single-threaded runtime; brush_core requires async.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
+            let runner = write_runner_script(
+                &test_name_owned,
+                &script_path,
+                &tmp_path_child,
+                &add_path_owned,
+                &strace_owned,
+            );
 
-            let passed = rt
-                .block_on(execute_test(
-                    &test_name_owned,
-                    &script_path,
-                    &tmp_path_child,
-                    &add_path_owned,
-                    &strace_owned,
-                ))
-                .unwrap_or(false);
-
-            // _exit skips Rust destructors, avoiding double-free of shared
-            // resources (tmp_dir, cgroup dir) that the parent owns.
-            unsafe { libc::_exit(if passed { 0 } else { 1 }) };
+            // Exec /bin/sh: replaces this child image entirely, no Rust
+            // destructors and no tokio runtime needed.
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new("/bin/sh")
+                .arg(&runner)
+                .exec();
+            eprintln!("exec /bin/sh failed: {err}");
+            unsafe { libc::_exit(1) };
         }
         child_pid => {
             // ── Parent process ─────────────────────────────────────────────
@@ -227,84 +224,50 @@ fn collect_result(mut pending: PendingTest) -> anyhow::Result<TestResult> {
     // dir removal, cgroup drops removing the cgroup directory.
 }
 
-async fn execute_test(
+/// Write a self-contained shell script that sources the function definitions
+/// and runs the named test. The child execs `/bin/sh` with this script.
+fn write_runner_script(
     test_name: &str,
-    script_path: &Path,
+    functions_path: &Path,
     working_dir: &Path,
     add_path: &[PathBuf],
     strace: &[String],
-) -> anyhow::Result<bool> {
-    use brush_builtins::ShellBuilderExt;
-    let mut shell = brush_core::Shell::builder()
-        .no_profile(true)
-        .no_rc(true)
-        .default_builtins(brush_builtins::BuiltinSet::BashMode)
-        .build()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to create shell: {e}"))?;
+) -> PathBuf {
+    let mut s = String::from("#!/bin/sh\n");
 
-    shell
-        .set_working_dir(working_dir)
-        .map_err(|e| anyhow::anyhow!("failed to set working dir: {e}"))?;
-
-    let params = brush_core::ExecutionParameters::default();
-
-    // Prepend strace wrapper dir to $PATH (must come before --add-path so wrappers intercept)
+    // Strace wrappers dir must precede add_path so wrappers intercept calls.
     if !strace.is_empty() {
         let strace_bin = working_dir.join("strace_bin");
-        shell
-            .run_string(
-                format!("export PATH={}:$PATH", strace_bin.display()),
-                &params,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to set strace PATH: {e}"))?;
+        s.push_str(&format!("export PATH={}:$PATH\n", strace_bin.display()));
     }
 
-    // Prepend --add-path directories to $PATH
     if !add_path.is_empty() {
         let prefix = add_path
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
             .join(":");
-        shell
-            .run_string(format!("export PATH={prefix}:$PATH"), &params)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to set PATH: {e}"))?;
+        s.push_str(&format!("export PATH={prefix}:$PATH\n"));
     }
 
-    // Redirect stdout and stderr to log files, then enable xtrace
-    let stdout_path = working_dir.join("stdout.log");
-    let xtrace_path = working_dir.join("xtrace.log");
-    let setup = format!(
-        "exec 1>{} 2>{} ; set -ex",
-        stdout_path.display(),
-        xtrace_path.display()
-    );
-    shell
-        .run_string(setup, &params)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to set up xtrace: {e}"))?;
+    // Redirect both stdout and stderr to log files, then enable xtrace.
+    let stdout = working_dir.join("stdout.log");
+    let xtrace = working_dir.join("xtrace.log");
+    s.push_str(&format!(
+        "exec 1>{} 2>{}\n",
+        stdout.display(),
+        xtrace.display()
+    ));
+    s.push_str("set -ex\n");
 
-    // Source the functions script
-    let empty: &[&str] = &[];
-    let source_result = shell
-        .source_script(script_path, empty.iter(), &params)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to source functions: {e}"))?;
+    // Source function definitions, then invoke the test function.
+    s.push_str(&format!(". {}\n", functions_path.display()));
+    s.push_str(test_name);
+    s.push('\n');
 
-    if !source_result.is_success() {
-        return Ok(false);
-    }
-
-    // Run the test function
-    let result = shell
-        .run_string(test_name.to_string(), &params)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to run test {test_name}: {e}"))?;
-
-    Ok(result.is_success())
+    let runner = working_dir.join("_runner.sh");
+    std::fs::write(&runner, &s).expect("write runner script");
+    runner
 }
 
 fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> anyhow::Result<()> {
@@ -379,93 +342,54 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn execute_passing_test() {
+    /// Parse `script` content and run `test_name` via fork_test + collect_result.
+    fn run_inline(script: &str, test_name: &str) -> TestResult {
         let tmp = TempDir::new().unwrap();
-        let script = tmp.path().join("functions.sh");
-        fs::write(&script, "test_pass() {\n  true\n}\n").unwrap();
-
-        let result = execute_test("test_pass", &script, tmp.path(), &[], &[])
-            .await
-            .unwrap();
-        assert!(result);
+        let path = tmp.path().join("t.sh");
+        fs::write(&path, script).unwrap();
+        let tf = crate::parser::parse_test_file(&path).unwrap();
+        let pending = fork_test(test_name, &tf.functions, &[], &[]).unwrap();
+        collect_result(pending).unwrap()
     }
 
-    #[tokio::test]
-    async fn execute_failing_test() {
-        let tmp = TempDir::new().unwrap();
-        let script = tmp.path().join("functions.sh");
-        fs::write(&script, "test_fail() {\n  false\n}\n").unwrap();
-
-        let result = execute_test("test_fail", &script, tmp.path(), &[], &[])
-            .await
-            .unwrap();
-        assert!(!result);
+    #[test]
+    fn execute_passing_test() {
+        assert!(run_inline("test_pass() {\n  true\n}\n", "test_pass").passed);
     }
 
-    #[tokio::test]
-    async fn execute_test_with_helper() {
-        let tmp = TempDir::new().unwrap();
-        let script = tmp.path().join("functions.sh");
-        fs::write(
-            &script,
-            "get_value() {\n  echo 42\n}\n\ntest_helper() {\n  val=$(get_value)\n  test \"$val\" = \"42\"\n}\n",
-        )
-        .unwrap();
-
-        let result = execute_test("test_helper", &script, tmp.path(), &[], &[])
-            .await
-            .unwrap();
-        assert!(result);
+    #[test]
+    fn execute_failing_test() {
+        assert!(!run_inline("test_fail() {\n  false\n}\n", "test_fail").passed);
     }
 
-    #[tokio::test]
-    async fn execute_test_stdout_captured() {
-        let tmp = TempDir::new().unwrap();
-        let script = tmp.path().join("functions.sh");
-        fs::write(&script, "test_echo() {\n  echo captured_output\n}\n").unwrap();
+    #[test]
+    fn execute_test_with_helper() {
+        assert!(run_inline(
+            "get_value() {\n  echo 42\n}\ntest_helper() {\n  val=$(get_value)\n  test \"$val\" = \"42\"\n}\n",
+            "test_helper",
+        ).passed);
+    }
 
-        execute_test("test_echo", &script, tmp.path(), &[], &[])
-            .await
-            .unwrap();
-        let stdout = fs::read_to_string(tmp.path().join("stdout.log")).unwrap();
+    #[test]
+    fn execute_test_stdout_captured() {
+        let r = run_inline("test_echo() {\n  echo captured_output\n}\n", "test_echo");
+        let stdout = fs::read_to_string(r.tmp_dir.join("stdout.log")).unwrap();
         assert!(stdout.contains("captured_output"));
     }
 
-    #[tokio::test]
-    async fn execute_test_with_add_path() {
+    #[test]
+    fn execute_test_with_add_path() {
         let tmp = TempDir::new().unwrap();
         let bin_dir = tmp.path().join("mybin");
         fs::create_dir(&bin_dir).unwrap();
 
-        let script = tmp.path().join("functions.sh");
-        // Test that the custom path is prepended by checking PATH contains it
-        fs::write(
-            &script,
-            "test_path() {\n  echo \"$PATH\" | grep -q mybin\n}\n",
-        )
-        .unwrap();
-
-        let result = execute_test("test_path", &script, tmp.path(), &[bin_dir], &[])
-            .await
-            .unwrap();
-        assert!(result);
-    }
-
-    #[tokio::test]
-    async fn execute_test_source_failure() {
-        let tmp = TempDir::new().unwrap();
-        let script = tmp.path().join("functions.sh");
-        // A script with a syntax error that fails to source
-        fs::write(&script, "test_bad() {\n").unwrap();
-
-        // Should return an error or false, not panic
-        let result = execute_test("test_bad", &script, tmp.path(), &[], &[]).await;
-        // Either an error or a failed test is acceptable
-        match result {
-            Ok(passed) => assert!(!passed),
-            Err(_) => {} // also fine
-        }
+        let script_content = "test_path() {\n  echo \"$PATH\" | grep -q mybin\n}\n";
+        let path = tmp.path().join("t.sh");
+        fs::write(&path, script_content).unwrap();
+        let tf = crate::parser::parse_test_file(&path).unwrap();
+        let pending = fork_test("test_path", &tf.functions, &[bin_dir], &[]).unwrap();
+        let result = collect_result(pending).unwrap();
+        assert!(result.passed);
     }
 
     #[test]

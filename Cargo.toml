@@ -12,12 +12,9 @@ cgroup = []
 [dependencies]
 anyhow = "1.0.100"
 libc = "0.2"
-brush-builtins = "0.1.0"
-brush-core = "0.4"
 brush-parser = "0.3"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 which = "8.0.2"

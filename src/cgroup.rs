@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
-static SETUP_OK: OnceLock<bool> = OnceLock::new();
-
-const ATTEST_CGROUP: &str = "/sys/fs/cgroup/attest";
+/// Resolved once per process: the `/sys/fs/cgroup/.../attest` directory that
+/// belongs to this user. `None` if cgroups are unavailable or unwritable.
+static ATTEST_BASE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Resource usage captured from cgroup v2 for a single test run.
 /// Fields are `None` when the corresponding controller is unavailable.
@@ -30,16 +30,7 @@ impl TestCgroup {
     /// Attempt to create a per-test cgroup directory. Returns `None` when
     /// cgroups are unavailable or the process lacks permission.
     pub fn try_create(test_id: &str) -> Option<Self> {
-        let ok = *SETUP_OK.get_or_init(|| match setup_parent_cgroup() {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::debug!("cgroup setup failed, resource tracking disabled: {e}");
-                false
-            }
-        });
-        if !ok {
-            return None;
-        }
+        let base = ATTEST_BASE.get_or_init(init_attest_base).as_ref()?;
 
         let safe_id: String = test_id
             .chars()
@@ -53,8 +44,7 @@ impl TestCgroup {
             .collect();
         let count = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir_name = format!("{safe_id}_{count}");
-
-        let path = PathBuf::from(ATTEST_CGROUP).join(&dir_name);
+        let path = base.join(&dir_name);
 
         if let Err(e) = std::fs::create_dir(&path) {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -107,19 +97,100 @@ impl Drop for TestCgroup {
     }
 }
 
-/// Create the shared `/sys/fs/cgroup/attest/` parent cgroup and enable
-/// resource controllers. Called at most once per process.
-fn setup_parent_cgroup() -> anyhow::Result<()> {
-    std::fs::create_dir_all(ATTEST_CGROUP)?;
-    // Enable controllers one at a time; ignore individual failures for
-    // controllers not available in this environment.
-    for ctrl in ["cpu", "memory", "io", "pids"] {
-        let _ = std::fs::write(
-            format!("{ATTEST_CGROUP}/cgroup.subtree_control"),
-            format!("+{ctrl}"),
-        );
+/// Find the nearest ancestor cgroup where `cgroup.procs` works, create the
+/// `attest` directory there, and enable resource controllers.
+///
+/// Rather than guessing from `cgroup.type` (whose semantics around
+/// "domain threaded" vary across kernel versions), we fork a throw-away probe
+/// child that actually attempts the write. EOPNOTSUPP at one level means we
+/// walk up and try the parent.
+fn init_attest_base() -> Option<PathBuf> {
+    let cg_content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = cg_content
+        .lines()
+        .find(|l| l.starts_with("0::"))?
+        .strip_prefix("0::")?
+        .trim()
+        .to_string();
+
+    let mut ancestor = PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+
+    loop {
+        let base = ancestor.join("attest");
+
+        // Create base dir; tolerate AlreadyExists from prior runs.
+        match std::fs::create_dir(&base) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                tracing::debug!("cannot create {}: {e}", base.display());
+                match ancestor.parent() {
+                    Some(p) if p != Path::new("/sys/fs/cgroup") => {
+                        ancestor = p.to_path_buf();
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        // Probe: create a temporary child cgroup and fork a process that
+        // writes its own PID to cgroup.procs, exiting 0 on success and 1
+        // on EOPNOTSUPP or any other error.
+        let probe = base.join("_probe");
+        let _ = std::fs::remove_dir(&probe); // clean up from a crashed prior run
+        let probe_ok = if std::fs::create_dir(&probe).is_ok() {
+            let result = probe_cgroup_procs(&probe);
+            let _ = std::fs::remove_dir(&probe); // child exited, cgroup is empty
+            result
+        } else {
+            false
+        };
+
+        if probe_ok {
+            for ctrl in ["cpu", "memory", "io", "pids"] {
+                let _ = std::fs::write(
+                    ancestor.join("cgroup.subtree_control"),
+                    format!("+{ctrl}"),
+                );
+                let _ = std::fs::write(
+                    base.join("cgroup.subtree_control"),
+                    format!("+{ctrl}"),
+                );
+            }
+            tracing::debug!("cgroup base: {}", base.display());
+            return Some(base);
+        }
+
+        tracing::debug!("cgroup.procs probe failed at {}; trying parent", base.display());
+        let _ = std::fs::remove_dir(&base); // may fail if non-empty, that's ok
+        match ancestor.parent() {
+            Some(p) if p != Path::new("/sys/fs/cgroup") => ancestor = p.to_path_buf(),
+            _ => break,
+        }
     }
-    Ok(())
+
+    tracing::debug!("cgroup setup failed: no suitable cgroup found in hierarchy");
+    None
+}
+
+/// Fork a child that writes its own PID to `dir/cgroup.procs` and exits 0 on
+/// success or 1 on failure. Returns true if the child exited with 0.
+fn probe_cgroup_procs(dir: &Path) -> bool {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return false;
+    }
+    if pid == 0 {
+        // Child process.
+        let my_pid = std::process::id().to_string();
+        let ok = std::fs::write(dir.join("cgroup.procs"), my_pid).is_ok();
+        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+    }
+    // Parent: wait for probe child.
+    let mut status = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
 }
 
 fn read_single_u64(path: impl AsRef<std::path::Path>) -> Option<u64> {
