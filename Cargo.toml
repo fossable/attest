@@ -6,6 +6,9 @@ license = "Unlicense"
 name = "attest"
 version = "0.1.0"
 
+[features]
+cgroup = []
+
 [dependencies]
 anyhow = "1.0.100"
 brush-builtins = "0.1.0"

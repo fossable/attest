@@ -10,6 +10,8 @@ pub struct TestResult {
     pub passed: bool,
     pub duration: Duration,
     pub tmp_dir: PathBuf,
+    #[cfg(feature = "cgroup")]
+    pub resources: Option<crate::cgroup::ResourceStats>,
 }
 
 pub struct RunConfig {
@@ -30,7 +32,7 @@ pub async fn run_all_tests(
     if config.sequential {
         for (test_name, all_functions) in tests {
             let result =
-                run_single_test(test_name, all_functions, &config.add_path, &config.strace)
+                run_single_test(test_name, all_functions, &config.add_path, &config.strace, true)
                     .await?;
             output::print_test_result(&result);
             let failed = !result.passed;
@@ -47,7 +49,7 @@ pub async fn run_all_tests(
             let add_path = config.add_path.clone();
             let strace = config.strace.clone();
             join_set.spawn(async move {
-                run_single_test(&test_name, &all_functions, &add_path, &strace).await
+                run_single_test(&test_name, &all_functions, &add_path, &strace, false).await
             });
         }
         while let Some(result) = join_set.join_next().await {
@@ -73,11 +75,13 @@ pub async fn run_all_tests(
     Ok(results)
 }
 
+#[cfg_attr(not(feature = "cgroup"), allow(unused_variables))]
 async fn run_single_test(
     test_name: &str,
     all_functions: &[FunctionDefinition],
     add_path: &[PathBuf],
     strace: &[String],
+    sequential: bool,
 ) -> anyhow::Result<TestResult> {
     let tmp_dir = tempfile::TempDir::new()?;
     let tmp_path = tmp_dir.path().to_path_buf();
@@ -97,7 +101,25 @@ async fn run_single_test(
         create_strace_wrappers(&tmp_path, strace)?;
     }
 
+    #[cfg(feature = "cgroup")]
+    let (passed, resources) = {
+        // Only track resources for sequential runs; parallel tests share the
+        // process and cannot be isolated per-test with cgroup.procs.
+        let cgroup = if sequential {
+            crate::cgroup::TestCgroup::try_create(test_name)
+        } else {
+            None
+        };
+        let passed = execute_test(test_name, &script_path, &tmp_path, add_path, strace).await?;
+        let resources = cgroup.as_ref().map(|cg| cg.read_stats());
+        // Drop moves the process back to the original cgroup and removes the
+        // test cgroup directory.
+        (passed, resources)
+    };
+
+    #[cfg(not(feature = "cgroup"))]
     let passed = execute_test(test_name, &script_path, &tmp_path, add_path, strace).await?;
+
     let duration = start.elapsed();
 
     // Persist the tmp dir so it's available for --failed
@@ -108,6 +130,8 @@ async fn run_single_test(
         passed,
         duration,
         tmp_dir: tmp_path,
+        #[cfg(feature = "cgroup")]
+        resources,
     })
 }
 
@@ -383,6 +407,8 @@ mod tests {
             passed: false,
             duration: Duration::from_millis(10),
             tmp_dir: test_tmp.clone(),
+            #[cfg(feature = "cgroup")]
+            resources: None,
         }];
 
         let failed_dir = tmp.path().join("failed");
