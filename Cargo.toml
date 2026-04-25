@@ -11,6 +11,7 @@ cgroup = []
 
 [dependencies]
 anyhow = "1.0.100"
+libc = "0.2"
 brush-builtins = "0.1.0"
 brush-core = "0.4"
 brush-parser = "0.3"

@@ -19,16 +19,15 @@ pub struct ResourceStats {
     pub pids_peak: Option<u64>,
 }
 
-/// A domain cgroup created for a single test. The whole process is moved into
-/// it on creation and restored to the original cgroup on drop.
+/// A cgroup directory created for a single test. The forked child calls
+/// `enter()` to place itself inside it; the parent reads stats after the child
+/// exits and the cgroup is cleaned up on drop.
 pub struct TestCgroup {
     path: PathBuf,
-    original_procs: PathBuf,
-    pid: String,
 }
 
 impl TestCgroup {
-    /// Attempt to create and enter a per-test cgroup. Returns `None` when
+    /// Attempt to create a per-test cgroup directory. Returns `None` when
     /// cgroups are unavailable or the process lacks permission.
     pub fn try_create(test_id: &str) -> Option<Self> {
         let ok = *SETUP_OK.get_or_init(|| match setup_parent_cgroup() {
@@ -39,14 +38,6 @@ impl TestCgroup {
             }
         });
         if !ok {
-            return None;
-        }
-
-        let original_cgroup = read_self_cgroup_path()?;
-        let original_procs = PathBuf::from(format!(
-            "/sys/fs/cgroup{original_cgroup}/cgroup.procs"
-        ));
-        if !original_procs.parent().map(|p| p.exists()).unwrap_or(false) {
             return None;
         }
 
@@ -79,18 +70,20 @@ impl TestCgroup {
             }
         }
 
-        let pid = std::process::id().to_string();
-        if let Err(e) = std::fs::write(path.join("cgroup.procs"), &pid) {
-            tracing::debug!("failed to enter test cgroup: {e}");
-            let _ = std::fs::remove_dir(&path);
-            return None;
-        }
-
-        Some(Self { path, original_procs, pid })
+        Some(Self { path })
     }
 
-    /// Read resource stats from the cgroup pseudo-files. Call this before
-    /// dropping the cgroup handle (i.e., while the cgroup is still active).
+    /// Place the current process into this cgroup. Call this from the forked
+    /// child immediately after fork, before running the test.
+    pub fn enter(&self) {
+        let pid = std::process::id().to_string();
+        if let Err(e) = std::fs::write(self.path.join("cgroup.procs"), &pid) {
+            tracing::debug!("failed to enter test cgroup: {e}");
+        }
+    }
+
+    /// Read resource stats from the cgroup pseudo-files. Call this after the
+    /// child has exited (waitpid returned) but before dropping the handle.
     pub fn read_stats(&self) -> ResourceStats {
         ResourceStats {
             cpu_user_usec: read_stat_field(self.path.join("cpu.stat"), "user_usec"),
@@ -108,10 +101,6 @@ impl TestCgroup {
 
 impl Drop for TestCgroup {
     fn drop(&mut self) {
-        // Restore process to its original cgroup before removing the test cgroup.
-        if let Err(e) = std::fs::write(&self.original_procs, &self.pid) {
-            tracing::warn!("failed to restore process to original cgroup: {e}");
-        }
         if let Err(e) = std::fs::remove_dir(&self.path) {
             tracing::warn!("failed to remove test cgroup {:?}: {e}", self.path);
         }
@@ -133,19 +122,6 @@ fn setup_parent_cgroup() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read the cgroup v2 path for the current process from `/proc/self/cgroup`.
-fn read_self_cgroup_path() -> Option<String> {
-    let content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    // cgroup v2 entries have the form "0::<path>"
-    let path = content
-        .lines()
-        .find(|l| l.starts_with("0::"))?
-        .strip_prefix("0::")?
-        .trim()
-        .to_string();
-    Some(path)
-}
-
 fn read_single_u64(path: impl AsRef<std::path::Path>) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
@@ -155,7 +131,11 @@ fn read_stat_field(path: impl AsRef<std::path::Path>, field: &str) -> Option<u64
     let content = std::fs::read_to_string(path).ok()?;
     content.lines().find_map(|line| {
         let (k, v) = line.split_once(' ')?;
-        if k == field { v.trim().parse().ok() } else { None }
+        if k == field {
+            v.trim().parse().ok()
+        } else {
+            None
+        }
     })
 }
 

@@ -146,6 +146,7 @@ dependencies = [
  "brush-core",
  "brush-parser",
  "clap",
+ "libc",
  "tempfile",
  "tokio",
  "tracing",

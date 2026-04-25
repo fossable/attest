@@ -62,8 +62,7 @@ enum Commands {
     Skill,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -125,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
                 .map(|(name, funcs)| (name.as_str(), funcs.as_slice()))
                 .collect();
 
-            let results = runner::run_all_tests(test_refs, &config).await?;
+            let results = runner::run_all_tests(test_refs, &config)?;
 
             if results.iter().any(|r| !r.passed) {
                 std::process::exit(1);

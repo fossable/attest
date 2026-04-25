@@ -68,7 +68,10 @@ pub(crate) fn is_shell_interpreter(shebang: &str) -> bool {
         parts.first().copied().unwrap_or("")
     };
     let basename = interpreter.rsplit('/').next().unwrap_or(interpreter);
-    matches!(basename, "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh" | "attest")
+    matches!(
+        basename,
+        "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh" | "attest"
+    )
 }
 
 #[cfg(test)]

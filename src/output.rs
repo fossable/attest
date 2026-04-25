@@ -41,9 +41,7 @@ fn print_resource_stats(r: &crate::cgroup::ResourceStats) {
     }
 
     match (r.io_read_bytes, r.io_write_bytes) {
-        (Some(rb), Some(wb)) => {
-            parts.push(format!("io={}/{}", format_bytes(rb), format_bytes(wb)))
-        }
+        (Some(rb), Some(wb)) => parts.push(format!("io={}/{}", format_bytes(rb), format_bytes(wb))),
         (Some(rb), None) => parts.push(format!("io={}r", format_bytes(rb))),
         (None, Some(wb)) => parts.push(format!("io={}w", format_bytes(wb))),
         (None, None) => {}
