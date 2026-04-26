@@ -12,7 +12,7 @@
   helper) to a temp script, creates a `brush_core::Shell` with `brush_builtins`,
   redirects stdout/stderr to log files, enables xtrace (`set -ex`), sources the
   script, then invokes the test function by name. Parallel by default via
-  `tokio::task::JoinSet`.
+  `fork(2)` with configurable parallelism (`--parallel`).
 - `src/output.rs` - ANSI-colored terminal output for PASS/FAIL and summary.
 
 ## Key dependencies

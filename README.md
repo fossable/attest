@@ -183,8 +183,8 @@ attest example.test
 # Run all tests in this directory
 attest .
 
-# Tests run in parallel by default, but can be forced to run sequentially
-attest --sequential .
+# Tests run in parallel by default; use --parallel to limit concurrency
+attest --parallel 1 .
 ```
 
 Every test runs in a temporary _context directory_ that collects logs and

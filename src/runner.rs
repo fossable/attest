@@ -45,7 +45,7 @@ impl Drop for PendingTest {
 }
 
 pub struct RunConfig {
-    pub sequential: bool,
+    pub parallel: usize,
     pub bail: bool,
     pub results: Option<PathBuf>,
     pub results_failed: Option<PathBuf>,
@@ -59,41 +59,49 @@ pub fn run_all_tests(
 ) -> anyhow::Result<Vec<TestResult>> {
     let mut results = Vec::new();
 
-    if config.sequential {
-        for (test_name, all_functions) in &tests {
-            let pending = fork_test(test_name, all_functions, &config.add_path, &config.strace)?;
-            let result = collect_result(pending)?;
-            output::print_test_result(&result);
-            let failed = !result.passed;
-            results.push(result);
-            if failed && config.bail {
-                break;
-            }
-        }
-    } else {
-        // Fork all tests, then collect results in order.
-        let mut pending_list: Vec<PendingTest> = Vec::new();
-        for (test_name, all_functions) in &tests {
+    let max_parallel = config.parallel.max(1);
+    let mut test_iter = tests.iter();
+    let mut pending_list: Vec<PendingTest> = Vec::new();
+    let mut bail_flag = false;
+
+    // Seed the initial batch up to max_parallel.
+    while pending_list.len() < max_parallel {
+        if let Some((test_name, all_functions)) = test_iter.next() {
             pending_list.push(fork_test(
                 test_name,
                 all_functions,
                 &config.add_path,
                 &config.strace,
             )?);
+        } else {
+            break;
         }
+    }
 
-        let mut bail_flag = false;
-        for p in pending_list {
-            if bail_flag {
-                // PendingTest::Drop kills the child and cleans up.
-                continue;
+    // Collect results in order; as each finishes, start the next test.
+    while !pending_list.is_empty() {
+        let pending = pending_list.remove(0);
+        if bail_flag {
+            // PendingTest::Drop kills the child and cleans up.
+            continue;
+        }
+        let result = collect_result(pending)?;
+        output::print_test_result(&result);
+        if !result.passed && config.bail {
+            bail_flag = true;
+        }
+        results.push(result);
+
+        // Start a new test if available.
+        if !bail_flag {
+            if let Some((test_name, all_functions)) = test_iter.next() {
+                pending_list.push(fork_test(
+                    test_name,
+                    all_functions,
+                    &config.add_path,
+                    &config.strace,
+                )?);
             }
-            let result = collect_result(p)?;
-            output::print_test_result(&result);
-            if !result.passed && config.bail {
-                bail_flag = true;
-            }
-            results.push(result);
         }
     }
 
@@ -475,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn run_all_tests_sequential() {
+    fn run_all_tests_serial() {
         let tmp = TempDir::new().unwrap();
         let script_content = "test_a() {\n  true\n}\ntest_b() {\n  true\n}\n";
 
@@ -485,7 +493,7 @@ mod tests {
         let test_file = crate::parser::parse_test_file(&path).unwrap();
 
         let config = RunConfig {
-            sequential: true,
+            parallel: 1,
             bail: false,
             results: None,
             results_failed: None,
@@ -515,7 +523,7 @@ mod tests {
         let test_file = crate::parser::parse_test_file(&path).unwrap();
 
         let config = RunConfig {
-            sequential: true,
+            parallel: 1,
             bail: true,
             results: None,
             results_failed: None,
@@ -545,7 +553,7 @@ mod tests {
         let test_file = crate::parser::parse_test_file(&path).unwrap();
 
         let config = RunConfig {
-            sequential: false,
+            parallel: 0,
             bail: false,
             results: None,
             results_failed: None,

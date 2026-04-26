@@ -20,9 +20,9 @@ struct Cli {
     #[arg(add = ArgValueCompleter::new(complete_tests))]
     path: Option<String>,
 
-    /// Run tests sequentially instead of in parallel
-    #[arg(long)]
-    sequential: bool,
+    /// Maximum number of tests to run in parallel (defaults to number of CPU cores)
+    #[arg(long, default_value_t = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))]
+    parallel: usize,
 
     /// Filter tests by pattern: `[<file>/]<name>` where `<name>` supports `*` wildcards and
     /// plain names match as prefixes (e.g. `foo.sh/test_net*`)
@@ -202,7 +202,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             let config = runner::RunConfig {
-                sequential: cli.sequential,
+                parallel: cli.parallel,
                 bail: cli.bail,
                 results: cli.results,
                 results_failed: cli.results_failed,
