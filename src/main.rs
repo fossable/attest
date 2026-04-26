@@ -1,5 +1,6 @@
 #[cfg(feature = "cgroup")]
 mod cgroup;
+mod diagnostics;
 mod discovery;
 mod output;
 mod parser;

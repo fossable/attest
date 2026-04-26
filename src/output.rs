@@ -1,11 +1,63 @@
 use std::time::Duration;
 
+use indicatif::{ProgressBar, ProgressStyle};
+
 use crate::parser::TestCase;
 use crate::runner::TestResult;
 
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
+
+pub struct StatusDisplay {
+    bar: Option<ProgressBar>,
+}
+
+impl StatusDisplay {
+    pub fn new(total: usize) -> Self {
+        if !indicatif::ProgressDrawTarget::stderr().is_hidden() {
+            let bar = ProgressBar::new(total as u64);
+            bar.set_style(
+                ProgressStyle::default_bar()
+                    .template("Testing {pos}/{len}: [{msg}]")
+                    .unwrap(),
+            );
+            bar.enable_steady_tick(Duration::from_millis(250));
+            Self { bar: Some(bar) }
+        } else {
+            Self { bar: None }
+        }
+    }
+
+    /// Update the status line with currently running tests and their elapsed times.
+    pub fn update(&self, running: &[(&str, Duration)], completed: usize) {
+        if let Some(ref bar) = self.bar {
+            bar.set_position(completed as u64);
+            let msg: String = running
+                .iter()
+                .map(|(name, elapsed)| format!("{}({})", name, format_duration(*elapsed)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bar.set_message(msg);
+        }
+    }
+
+    /// Run a closure with the status line temporarily hidden, so printed output
+    /// doesn't collide with it.
+    pub fn suspend<F: FnOnce()>(&self, f: F) {
+        if let Some(ref bar) = self.bar {
+            bar.suspend(f);
+        } else {
+            f();
+        }
+    }
+
+    pub fn finish(&self) {
+        if let Some(ref bar) = self.bar {
+            bar.finish_and_clear();
+        }
+    }
+}
 
 pub fn print_test_result(result: &TestResult) {
     let (label, color) = if result.passed {
@@ -18,6 +70,9 @@ pub fn print_test_result(result: &TestResult) {
     #[cfg(feature = "cgroup")]
     if let Some(ref r) = result.resources {
         print_resource_stats(r);
+    }
+    if !result.passed {
+        crate::diagnostics::print_failure_snippet(result);
     }
 }
 

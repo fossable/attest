@@ -10,6 +10,7 @@ pub struct TestResult {
     pub passed: bool,
     pub duration: Duration,
     pub tmp_dir: PathBuf,
+    pub source_path: PathBuf,
     #[cfg(feature = "cgroup")]
     pub resources: Option<crate::cgroup::ResourceStats>,
 }
@@ -24,6 +25,7 @@ struct PendingTest {
     start: Instant,
     /// `None` after the path has been transferred to `TestResult`.
     tmp_dir: Option<PathBuf>,
+    source_path: PathBuf,
     #[cfg(feature = "cgroup")]
     cgroup: Option<crate::cgroup::TestCgroup>,
 }
@@ -58,6 +60,8 @@ pub fn run_all_tests(
     config: &RunConfig,
 ) -> anyhow::Result<Vec<TestResult>> {
     let mut results = Vec::new();
+    let total = tests.len();
+    let status = output::StatusDisplay::new(total);
 
     let max_parallel = config.parallel.max(1);
     let mut test_iter = tests.iter();
@@ -79,33 +83,75 @@ pub fn run_all_tests(
         }
     }
 
-    // Collect results in order; as each finishes, start the next test.
+    // Poll loop: non-blocking reap, process completions, update status.
     while !pending_list.is_empty() {
-        let pending = pending_list.remove(0);
-        if bail_flag {
-            // PendingTest::Drop kills the child and cleans up.
-            continue;
+        // Non-blocking reap: check all pending tests with WNOHANG.
+        let mut reaped: Vec<(usize, libc::c_int)> = Vec::new();
+        for (i, pending) in pending_list.iter().enumerate() {
+            let mut status_code: libc::c_int = 0;
+            let ret = unsafe { libc::waitpid(pending.pid, &mut status_code, libc::WNOHANG) };
+            if ret > 0 {
+                reaped.push((i, status_code));
+            } else if ret == -1 {
+                return Err(anyhow::anyhow!(
+                    "waitpid failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            // ret == 0 means child still running
         }
-        let result = collect_result(pending)?;
-        output::print_test_result(&result);
-        if !result.passed && config.bail {
-            bail_flag = true;
-        }
-        results.push(result);
 
-        // Start a new test if available.
-        if !bail_flag {
-            if let Some((test_name, all_functions, source_path)) = test_iter.next() {
-                pending_list.push(fork_test(
-                    test_name,
-                    all_functions,
-                    source_path,
-                    &config.add_path,
-                    &config.strace,
-                )?);
+        // Process reaped tests in reverse index order so removal doesn't shift indices.
+        reaped.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut completed: Vec<TestResult> = Vec::new();
+        for (i, exit_status) in reaped {
+            let mut pending = pending_list.remove(i);
+            if bail_flag {
+                continue; // Drop kills + cleans up
+            }
+            pending.reaped = true;
+            let result = build_result(pending, exit_status);
+            completed.push(result);
+        }
+
+        // Print results and start new tests.
+        // Sort completed by name for deterministic output within a reap batch.
+        completed.sort_by(|a, b| a.name.cmp(&b.name));
+        for result in completed {
+            status.suspend(|| output::print_test_result(&result));
+            if !result.passed && config.bail {
+                bail_flag = true;
+            }
+            results.push(result);
+
+            if !bail_flag {
+                if let Some((test_name, all_functions, source_path)) = test_iter.next() {
+                    pending_list.push(fork_test(
+                        test_name,
+                        all_functions,
+                        source_path,
+                        &config.add_path,
+                        &config.strace,
+                    )?);
+                }
             }
         }
+
+        if pending_list.is_empty() {
+            break;
+        }
+
+        // Update status line with currently running tests.
+        let running: Vec<(&str, std::time::Duration)> = pending_list
+            .iter()
+            .map(|p| (p.name.as_str(), p.start.elapsed()))
+            .collect();
+        status.update(&running, results.len());
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+
+    status.finish();
 
     if let Some(ref dir) = config.results {
         copy_results_dirs(&results, dir, false)?;
@@ -119,7 +165,7 @@ pub fn run_all_tests(
 }
 
 /// Fork a child process that will run the test. Returns a `PendingTest` that
-/// the caller must pass to `collect_result` (or simply drop to kill+clean up).
+/// the caller must pass to `wait_and_collect` (or simply drop to kill+clean up).
 fn fork_test(
     test_name: &str,
     all_functions: &[FunctionDefinition],
@@ -203,6 +249,7 @@ fn fork_test(
                 name: test_name.to_string(),
                 start,
                 tmp_dir: Some(tmp_path),
+                source_path: source_path_owned,
                 #[cfg(feature = "cgroup")]
                 cgroup,
             })
@@ -210,18 +257,9 @@ fn fork_test(
     }
 }
 
-/// Wait for a forked test child and build the `TestResult`.
-fn collect_result(mut pending: PendingTest) -> anyhow::Result<TestResult> {
-    let mut status: libc::c_int = 0;
-    let ret = unsafe { libc::waitpid(pending.pid, &mut status, 0) };
-    if ret == -1 {
-        return Err(anyhow::anyhow!(
-            "waitpid failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    pending.reaped = true;
-
+/// Build a `TestResult` from a `PendingTest` whose child has already been
+/// reaped with the given raw `waitpid` status.
+fn build_result(mut pending: PendingTest, status: libc::c_int) -> TestResult {
     let duration = pending.start.elapsed();
     let passed = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
 
@@ -231,14 +269,15 @@ fn collect_result(mut pending: PendingTest) -> anyhow::Result<TestResult> {
 
     let tmp_dir = pending.tmp_dir.take().unwrap();
 
-    Ok(TestResult {
+    TestResult {
         name: pending.name.clone(),
         passed,
         duration,
         tmp_dir,
+        source_path: pending.source_path.clone(),
         #[cfg(feature = "cgroup")]
         resources,
-    })
+    }
     // pending drops here: reaped=true skips kill/wait, tmp_dir=None skips
     // dir removal, cgroup drops removing the cgroup directory.
 }
@@ -278,6 +317,7 @@ fn build_runner_script(
         stdout.display(),
         xtrace.display()
     ));
+    s.push_str("PS4='+$LINENO: '\n");
     s.push_str("set -ex\n");
 
     // Source function definitions, then invoke the test function.
@@ -360,14 +400,23 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Parse `script` content and run `test_name` via fork_test + collect_result.
+    /// Blocking wait + build result, for tests only.
+    fn wait_and_collect(mut pending: PendingTest) -> TestResult {
+        let mut status: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(pending.pid, &mut status, 0) };
+        assert!(ret > 0, "waitpid failed");
+        pending.reaped = true;
+        build_result(pending, status)
+    }
+
+    /// Parse `script` content and run `test_name` via fork_test + wait_and_collect.
     fn run_inline(script: &str, test_name: &str) -> TestResult {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("t.sh");
         fs::write(&path, script).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let pending = fork_test(test_name, &tf.functions, &path, &[], &[]).unwrap();
-        collect_result(pending).unwrap()
+        wait_and_collect(pending)
     }
 
     #[test]
@@ -406,7 +455,7 @@ mod tests {
         fs::write(&path, script_content).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let pending = fork_test("test_path", &tf.functions, &path, &[bin_dir], &[]).unwrap();
-        let result = collect_result(pending).unwrap();
+        let result = wait_and_collect(pending);
         assert!(result.passed);
     }
 
@@ -447,6 +496,7 @@ mod tests {
             passed: false,
             duration: Duration::from_millis(10),
             tmp_dir: test_tmp.clone(),
+            source_path: PathBuf::from("test.sh"),
             #[cfg(feature = "cgroup")]
             resources: None,
         }];

@@ -1,0 +1,27 @@
+#!/usr/bin/attest
+## Useful to simulate long-running tests
+
+testHelp() {
+	sleep --help
+}
+
+testVersion() {
+	sleep --version
+}
+
+testInt() {
+	sleep 1
+}
+
+testFloat() {
+	sleep 2.0
+}
+
+testUnits() {
+	sleep 1s
+	sleep 0.1m
+}
+
+testLong() {
+	sleep 10
+}
