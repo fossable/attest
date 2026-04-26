@@ -1,12 +1,19 @@
-**attest** might be the simplest test framework ever. There is no exotic test
-syntax to remember, assertion API, or hidden lifecycle methods to know about.
-Tests are just regular shell functions where every line is an assertion.
+**attest** is a dead simple test framework. There is no exotic test syntax to
+remember, assertion API, or hidden lifecycle methods to know about. Tests are
+just regular shell functions where every line is an assertion.
 
-We already have all of the tools we need in the shell:
+We already have all of the tools we need to write tests in the shell:
 
+- Shell functions neatly organize tests into runnable units
 - Need to compare text? `[` and `[[` have been around for decades
 - Need to compare JSON? `jq -c` has you covered.
 - Need some test setup/cleanup? Easy with helper functions and traps.
+
+By keeping the framework lightweight, tests are easy to write and quick to
+understand, leading to more effective tests.
+
+By writing the tests in a shell scripting language, we operate at a high level
+of abstraction.
 
 ## Writing tests
 
@@ -21,21 +28,54 @@ testHello() {
 }
 ```
 
-There are only two implicit pieces of knowledge that you need for writing tests:
+There are only three implicit pieces of knowledge that you need for writing
+tests:
 
-- If any command in your function exits nonzero, the test fails
-- All tests run in a separate temporary directory
+- All test functions are named starting with `test`
+- If any command in your function exits nonzero, the whole test fails
+- Each test runs in a separate temporary directory
 
-## Generating tests with AI
+### Inline tests
+
+If you're testing something that's itself a shell script, you can also include
+your tests inline with the script. For example:
+
+```sh
+#!/bin/bash
+## Add two numbers.
+
+echo $(( $1 + $2 ))
+
+## No input fails
+testNoInput() {
+	! $0
+}
+
+## Good input
+testGoodInput() {
+	result=$($0 1 2)
+
+	[ ${result} -eq 3 ]
+}
+
+## Bad input
+testBadInput() {
+	! $0 1 1.2
+}
+```
+
+This is nice because the closer the tests are to the code that's being tested,
+the more likely they are maintained over time.
+
+### Generating tests with AI
 
 **attest** tests are also easy for AIs to write. Use `attest skill` to print the
-a skill which is tuned to produce quality tests. Here's an example prompt:
+a skill which is pre-tuned to produce good tests. Here's an example prompt:
 
 > Write attest-style tests for the `tac` command.
 
-Here's the output from Haiku 4.5:
-
-<detail>
+<details>
+<summary>Here's the output from Haiku 4.5:</summary>
 
 ```sh
 #!/usr/bin/env attest
@@ -127,7 +167,10 @@ testMixedInput() {
 }
 ```
 
-</detail>
+</details>
+
+AI can generate tests all day, so the important thing is how easy it is for a
+human to quickly understand and assess the quality of AI-produced tests.
 
 ## Running tests
 

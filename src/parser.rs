@@ -5,14 +5,94 @@ use anyhow::Context;
 use brush_parser::ast::{Command, CompoundCommand, CompoundList, FunctionDefinition, Program};
 use brush_parser::{Parser, ParserOptions, SourceInfo};
 
+/// File containing tests.
 pub struct TestFile {
     pub tests: Vec<TestCase>,
     pub functions: Vec<FunctionDefinition>,
 }
 
+/// Test function within a `TestFile`.
 pub struct TestCase {
     pub file: PathBuf,
     pub name: String,
+}
+
+/// A pattern for selecting tests, parsed from `[<file>/]<name-pattern>`.
+///
+/// - `file`: if present, `test.file` must end with this path
+/// - `name`: if present, matches the test function name; `*` is a wildcard;
+///   a pattern without `*` matches any name that starts with the pattern
+pub struct TestPattern {
+    pub file: Option<PathBuf>,
+    pub name: Option<String>,
+}
+
+impl TestPattern {
+    pub fn parse(s: &str) -> Self {
+        match s.rfind('/') {
+            Some(slash) => {
+                let file_part = &s[..slash];
+                let name_part = &s[slash + 1..];
+                Self {
+                    file: if file_part.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(file_part))
+                    },
+                    name: if name_part.is_empty() {
+                        None
+                    } else {
+                        Some(name_part.to_string())
+                    },
+                }
+            }
+            None => Self {
+                file: None,
+                name: if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                },
+            },
+        }
+    }
+
+    pub fn matches(&self, test: &TestCase) -> bool {
+        if let Some(ref file_pat) = self.file {
+            if !test.file.ends_with(file_pat) {
+                return false;
+            }
+        }
+        if let Some(ref name_pat) = self.name {
+            if !wildcard_match(name_pat, &test.name) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Match `text` against `pattern`.  `*` matches any sequence of characters.
+/// A pattern with no `*` is treated as a prefix (implicit trailing `*`).
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    if !pattern.contains('*') {
+        return text.starts_with(pattern);
+    }
+    let segments: Vec<&str> = pattern.split('*').collect();
+    if !text.starts_with(segments[0]) {
+        return false;
+    }
+    let mut remaining = &text[segments[0].len()..];
+    for seg in &segments[1..segments.len() - 1] {
+        if seg.is_empty() {
+            continue;
+        }
+        match remaining.find(seg) {
+            Some(i) => remaining = &remaining[i + seg.len()..],
+            None => return false,
+        }
+    }
+    remaining.ends_with(segments[segments.len() - 1])
 }
 
 pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
@@ -120,6 +200,67 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    fn make_case(file: &str, name: &str) -> TestCase {
+        TestCase {
+            file: PathBuf::from(file),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn pattern_parse_name_only() {
+        let p = TestPattern::parse("test_foo");
+        assert!(p.file.is_none());
+        assert_eq!(p.name.as_deref(), Some("test_foo"));
+    }
+
+    #[test]
+    fn pattern_parse_file_and_name() {
+        let p = TestPattern::parse("foo.sh/test_bar");
+        assert_eq!(p.file.as_deref(), Some(Path::new("foo.sh")));
+        assert_eq!(p.name.as_deref(), Some("test_bar"));
+    }
+
+    #[test]
+    fn pattern_parse_file_only() {
+        let p = TestPattern::parse("foo.sh/");
+        assert_eq!(p.file.as_deref(), Some(Path::new("foo.sh")));
+        assert!(p.name.is_none());
+
+        let p = TestPattern::parse("./foo.sh");
+        assert_eq!(p.file.as_deref(), Some(Path::new("foo.sh")));
+        assert!(p.name.is_none());
+    }
+
+    #[test]
+    fn pattern_prefix_match() {
+        let p = TestPattern::parse("test_foo");
+        assert!(p.matches(&make_case("/any/file.sh", "test_foo")));
+        assert!(p.matches(&make_case("/any/file.sh", "test_foo_bar")));
+        assert!(!p.matches(&make_case("/any/file.sh", "test_baz")));
+    }
+
+    #[test]
+    fn pattern_wildcard_match() {
+        let p = TestPattern::parse("test_*_end");
+        assert!(p.matches(&make_case("f.sh", "test_foo_end")));
+        assert!(!p.matches(&make_case("f.sh", "test_foo_end_extra")));
+    }
+
+    #[test]
+    fn pattern_file_filter() {
+        let p = TestPattern::parse("foo.sh/test_");
+        assert!(p.matches(&make_case("/path/to/foo.sh", "test_bar")));
+        assert!(!p.matches(&make_case("/path/to/bar.sh", "test_bar")));
+    }
+
+    #[test]
+    fn pattern_file_subpath() {
+        let p = TestPattern::parse("tests/foo.sh/test_");
+        assert!(p.matches(&make_case("/repo/tests/foo.sh", "test_bar")));
+        assert!(!p.matches(&make_case("/repo/other/foo.sh", "test_bar")));
+    }
 
     fn write_script(dir: &Path, name: &str, content: &str) -> PathBuf {
         let path = dir.join(name);

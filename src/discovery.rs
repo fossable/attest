@@ -28,6 +28,13 @@ fn collect_script_files(dir: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'))
+        {
+            continue;
+        }
         if path.is_dir() {
             collect_script_files(&path, files)?;
         } else if is_shell_script(&path) {

@@ -94,7 +94,12 @@ pub fn print_summary(results: &[TestResult]) {
 
 pub fn print_test_list(tests: &[TestCase]) {
     for test in tests {
-        println!("{}:{}", test.file.display(), test.name);
+        let filename = test
+            .file
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_else(|| test.file.to_string_lossy());
+        println!("{}/{}", filename, test.name);
     }
 }
 
