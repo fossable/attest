@@ -1,6 +1,12 @@
-**attest** is a dead simple test framework. There is no exotic test syntax to
-remember, assertion API, or hidden lifecycle methods to know about. Tests are
-just regular shell functions where every line is an assertion.
+> perfection is finally attained not when there is no longer anything to add,
+> but when there is no longer anything to take away
+>
+> Terre des Hommes (1939) - Antoine de Saint Exupéry
+
+**attest** is a simple and modern test framework for CLI programs. There is no
+exotic test syntax to remember, assertion API, or hidden lifecycle methods to
+know about. Tests are just regular shell functions where every command is an
+assertion.
 
 We already have all of the tools we need to write tests in the shell:
 
@@ -22,9 +28,9 @@ Here's an illustrative example of a test for the `md5sum` command:
 ```sh
 ## Test the md5sum command with known input/output
 testHello() {
-	result=$(echo hello | md5sum) # If md5sum exits nonzero, the test fails
+	result=$(echo hello | md5sum) # Test fails if nonzero exit
 
-	[ "${result}" = "b1946ac92492d2347c6235b4d2611184  -" ] # If the output changes, the test fails
+	[ "${result}" = "b1946ac92492d2347c6235b4d2611184  -" ] # Test fails if output changes
 }
 ```
 
@@ -38,39 +44,90 @@ tests:
 ### Inline tests
 
 If you're testing something that's itself a shell script, you can also include
-your tests inline with the script. For example:
+your tests inline with the script.
+
+<details>
+<summary>For example:</summary>
 
 ```sh
-#!/bin/bash
-## Add two numbers.
+#!/usr/bin/env bash
 
-echo $(( $1 + $2 ))
+## Inline tests can be placed anywhere in the script. You can use $0 to call
+## the script we're embedded in.
 
-## No input fails
-testNoInput() {
-	! $0
-}
-
-## Good input
 testGoodInput() {
 	result=$($0 1 2)
 
 	[ ${result} -eq 3 ]
 }
 
-## Bad input
+testNoInput() {
+	! $0
+}
+
 testBadInput() {
 	! $0 1 1.2
 }
+
+testTooManyArgs() {
+	! $0 1 2 3
+}
+
+# Here is the actual implementation of the script. It's not important for our
+# purposes; I just prompted Claude for the most complicated way to add two
+# numbers. The model calls it "enterprise grade" :)
+
+python3 -c "
+import subprocess, json, sys, os, tempfile, re
+
+def validate(x):
+  result = subprocess.run(
+      ['bash', '-c', f'printf \"%d\" \"{x}\" 2>/dev/null || exit 1'],
+      capture_output=True, text=True
+  )
+  if result.returncode != 0:
+      raise ValueError(f'not an integer: {x}')
+  return x
+
+def add(a, b):
+  validate(a)
+  validate(b)
+
+  with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+      json.dump({'operands': [a, b], 'operation': 'addition'}, f)
+      fname = f.name
+
+  with open(fname) as f:
+      payload = json.load(f)
+
+  os.unlink(fname)
+
+  result = subprocess.run(
+      ['awk', '-v', f'a={payload[\"operands\"][0]}', '-v', f'b={payload[\"operands\"][1]}',
+       'BEGIN { print a + b }'],
+      capture_output=True, text=True
+  )
+  return result.stdout.strip()
+
+if len(sys.argv) != 3:
+  sys.exit(1)
+
+try:
+  print(add(sys.argv[1], sys.argv[2]))
+except ValueError:
+  sys.exit(1)
+" "$1" "$2"
 ```
 
-This is nice because the closer the tests are to the code that's being tested,
-the more likely they are maintained over time.
+Inline tests can be nice because the closer the tests are to the code that's
+being tested, the more likely they are maintained over time.
+
+</details>
 
 ### Generating tests with AI
 
-**attest** tests are also easy for AIs to write. Use `attest skill` to print the
-a skill which is pre-tuned to produce good tests. Here's an example prompt:
+Tests are also easy for AIs to write. Use `attest skill` to print the a skill
+which is pre-tuned to produce good tests. Here's an example prompt:
 
 > Write attest-style tests for the `tac` command.
 
@@ -174,7 +231,7 @@ human to quickly understand and assess the quality of AI-produced tests.
 
 ## Running tests
 
-Now that we have some tests, it's time for the good part.
+Now that we have some tests, AI-generated or not, it's time for the good part.
 
 ```sh
 # Just run the tests in one file

@@ -197,7 +197,7 @@ fn main() -> anyhow::Result<()> {
                     {
                         continue;
                     }
-                    all_tests.push((test.name, functions.clone()));
+                    all_tests.push((test.name, functions.clone(), file.clone()));
                 }
             }
 
@@ -210,9 +210,9 @@ fn main() -> anyhow::Result<()> {
                 strace: cli.strace,
             };
 
-            let test_refs: Vec<(&str, &[brush_parser::ast::FunctionDefinition])> = all_tests
+            let test_refs: Vec<(&str, &[brush_parser::ast::FunctionDefinition], &std::path::Path)> = all_tests
                 .iter()
-                .map(|(name, funcs)| (name.as_str(), funcs.as_slice()))
+                .map(|(name, funcs, src)| (name.as_str(), funcs.as_slice(), src.as_path()))
                 .collect();
 
             let results = runner::run_all_tests(test_refs, &config)?;

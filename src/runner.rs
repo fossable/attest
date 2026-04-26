@@ -54,7 +54,7 @@ pub struct RunConfig {
 }
 
 pub fn run_all_tests(
-    tests: Vec<(&str, &[FunctionDefinition])>,
+    tests: Vec<(&str, &[FunctionDefinition], &Path)>,
     config: &RunConfig,
 ) -> anyhow::Result<Vec<TestResult>> {
     let mut results = Vec::new();
@@ -66,10 +66,11 @@ pub fn run_all_tests(
 
     // Seed the initial batch up to max_parallel.
     while pending_list.len() < max_parallel {
-        if let Some((test_name, all_functions)) = test_iter.next() {
+        if let Some((test_name, all_functions, source_path)) = test_iter.next() {
             pending_list.push(fork_test(
                 test_name,
                 all_functions,
+                source_path,
                 &config.add_path,
                 &config.strace,
             )?);
@@ -94,10 +95,11 @@ pub fn run_all_tests(
 
         // Start a new test if available.
         if !bail_flag {
-            if let Some((test_name, all_functions)) = test_iter.next() {
+            if let Some((test_name, all_functions, source_path)) = test_iter.next() {
                 pending_list.push(fork_test(
                     test_name,
                     all_functions,
+                    source_path,
                     &config.add_path,
                     &config.strace,
                 )?);
@@ -121,6 +123,7 @@ pub fn run_all_tests(
 fn fork_test(
     test_name: &str,
     all_functions: &[FunctionDefinition],
+    source_path: &Path,
     add_path: &[PathBuf],
     strace: &[String],
 ) -> anyhow::Result<PendingTest> {
@@ -143,6 +146,9 @@ fn fork_test(
     // Clone data the child will need (fork copies memory, but owned values
     // need to be independent so both sides can operate without aliasing).
     let test_name_owned = test_name.to_string();
+    let source_path_owned = source_path
+        .canonicalize()
+        .unwrap_or_else(|_| source_path.to_path_buf());
     let add_path_owned = add_path.to_vec();
     let strace_owned = strace.to_vec();
     let tmp_path_child = tmp_path.clone();
@@ -167,7 +173,7 @@ fn fork_test(
                 cg.enter();
             }
 
-            let runner = write_runner_script(
+            let runner_content = build_runner_script(
                 &test_name_owned,
                 &script_path,
                 &tmp_path_child,
@@ -175,11 +181,16 @@ fn fork_test(
                 &strace_owned,
             );
 
-            // Exec /bin/sh: replaces this child image entirely, no Rust
-            // destructors and no tokio runtime needed.
+            // Exec /bin/sh -c <script> <source_path>: replaces this child
+            // image entirely. Passing source_path as argv[0] makes $0 inside
+            // the test functions refer to the original script, not the runner.
             use std::os::unix::process::CommandExt;
+            let source_str = source_path_owned
+                .to_str()
+                .unwrap_or("sh")
+                .to_string();
             let err = std::process::Command::new("/bin/sh")
-                .arg(&runner)
+                .args(["-c", &runner_content, &source_str])
                 .exec();
             eprintln!("exec /bin/sh failed: {err}");
             unsafe { libc::_exit(1) };
@@ -232,16 +243,17 @@ fn collect_result(mut pending: PendingTest) -> anyhow::Result<TestResult> {
     // dir removal, cgroup drops removing the cgroup directory.
 }
 
-/// Write a self-contained shell script that sources the function definitions
-/// and runs the named test. The child execs `/bin/sh` with this script.
-fn write_runner_script(
+/// Build the shell script content that sources the function definitions and
+/// runs the named test. Used with `/bin/sh -c <content> <source_path>` so
+/// that `$0` inside test functions refers to the original script.
+fn build_runner_script(
     test_name: &str,
     functions_path: &Path,
     working_dir: &Path,
     add_path: &[PathBuf],
     strace: &[String],
-) -> PathBuf {
-    let mut s = String::from("#!/bin/sh\n");
+) -> String {
+    let mut s = String::new();
 
     // Strace wrappers dir must precede add_path so wrappers intercept calls.
     if !strace.is_empty() {
@@ -273,9 +285,7 @@ fn write_runner_script(
     s.push_str(test_name);
     s.push('\n');
 
-    let runner = working_dir.join("_runner.sh");
-    std::fs::write(&runner, &s).expect("write runner script");
-    runner
+    s
 }
 
 fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> anyhow::Result<()> {
@@ -356,7 +366,7 @@ mod tests {
         let path = tmp.path().join("t.sh");
         fs::write(&path, script).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
-        let pending = fork_test(test_name, &tf.functions, &[], &[]).unwrap();
+        let pending = fork_test(test_name, &tf.functions, &path, &[], &[]).unwrap();
         collect_result(pending).unwrap()
     }
 
@@ -395,7 +405,7 @@ mod tests {
         let path = tmp.path().join("t.sh");
         fs::write(&path, script_content).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
-        let pending = fork_test("test_path", &tf.functions, &[bin_dir], &[]).unwrap();
+        let pending = fork_test("test_path", &tf.functions, &path, &[bin_dir], &[]).unwrap();
         let result = collect_result(pending).unwrap();
         assert!(result.passed);
     }
@@ -501,10 +511,10 @@ mod tests {
             strace: vec![],
         };
 
-        let test_refs: Vec<(&str, &[FunctionDefinition])> = test_file
+        let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
             .tests
             .iter()
-            .map(|t| (t.name.as_str(), test_file.functions.as_slice()))
+            .map(|t| (t.name.as_str(), test_file.functions.as_slice(), path.as_path()))
             .collect();
 
         let results = run_all_tests(test_refs, &config).unwrap();
@@ -531,10 +541,10 @@ mod tests {
             strace: vec![],
         };
 
-        let test_refs: Vec<(&str, &[FunctionDefinition])> = test_file
+        let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
             .tests
             .iter()
-            .map(|t| (t.name.as_str(), test_file.functions.as_slice()))
+            .map(|t| (t.name.as_str(), test_file.functions.as_slice(), path.as_path()))
             .collect();
 
         let results = run_all_tests(test_refs, &config).unwrap();
@@ -561,10 +571,10 @@ mod tests {
             strace: vec![],
         };
 
-        let test_refs: Vec<(&str, &[FunctionDefinition])> = test_file
+        let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
             .tests
             .iter()
-            .map(|t| (t.name.as_str(), test_file.functions.as_slice()))
+            .map(|t| (t.name.as_str(), test_file.functions.as_slice(), path.as_path()))
             .collect();
 
         let results = run_all_tests(test_refs, &config).unwrap();
