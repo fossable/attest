@@ -29,6 +29,8 @@ pub struct TestPattern {
 
 impl TestPattern {
     pub fn parse(s: &str) -> Self {
+        let is_path = s.starts_with("./");
+        let s = s.strip_prefix("./").unwrap_or(s);
         match s.rfind('/') {
             Some(slash) => {
                 let file_part = &s[..slash];
@@ -46,6 +48,14 @@ impl TestPattern {
                     },
                 }
             }
+            None if is_path => Self {
+                file: if s.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(s))
+                },
+                name: None,
+            },
             None => Self {
                 file: None,
                 name: if s.is_empty() {
@@ -231,6 +241,10 @@ mod tests {
         let p = TestPattern::parse("./foo.sh");
         assert_eq!(p.file.as_deref(), Some(Path::new("foo.sh")));
         assert!(p.name.is_none());
+
+        let p = TestPattern::parse("./foo.sh/test_bar");
+        assert_eq!(p.file.as_deref(), Some(Path::new("foo.sh")));
+        assert_eq!(p.name.as_deref(), Some("test_bar"));
     }
 
     #[test]

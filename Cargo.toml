@@ -1,12 +1,13 @@
 [package]
 authors = ["cilki"]
-description = "AI era test framework"
+description = "Dead simple test framework for the age of AI"
 edition = "2024"
 license = "Unlicense"
 name = "attest"
-version = "0.1.0"
+version = "0.2.0"
 
 [features]
+default = ["cgroup"]
 cgroup = []
 
 [dependencies]

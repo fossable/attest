@@ -38,5 +38,4 @@ tests.
 
 ## TODO list
 
-- Each test runs in a cgroup and we log the CPU time, IO, memory that the test
-  consumed.
+- Refine the runner UI
