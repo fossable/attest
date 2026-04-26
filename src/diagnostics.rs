@@ -42,10 +42,17 @@ pub fn print_failure_snippet(result: &TestResult) {
         return;
     };
 
-    if let Some((_lineno, byte_start, byte_end)) =
+    if let Some(match_info) =
         find_line_in_source(&original_source, &result.name, failing_line_trimmed)
     {
-        render_snippet(&result.source_path, &original_source, byte_start, byte_end);
+        render_snippet(
+            &result.source_path,
+            &original_source,
+            match_info.byte_start,
+            match_info.byte_end,
+            match_info.func_start_line,
+            match_info.func_end_line,
+        );
     }
 
     // If the failing command is a `[` expression, show operand details
@@ -81,16 +88,20 @@ fn parse_xtrace_failure(tmp_dir: &Path) -> Option<FailureInfo> {
     last_match
 }
 
+struct SourceMatch {
+    byte_start: usize,
+    byte_end: usize,
+    /// 0-based line where the function definition starts.
+    func_start_line: usize,
+    /// 0-based line where the function ends (closing brace).
+    func_end_line: usize,
+}
+
 /// Find a line matching `needle` inside the named function in the original source.
-/// Returns (1-based line number, byte start, byte end) of the match.
-fn find_line_in_source(
-    source: &str,
-    function_name: &str,
-    needle: &str,
-) -> Option<(usize, usize, usize)> {
-    // Find the function definition line
+fn find_line_in_source(source: &str, function_name: &str, needle: &str) -> Option<SourceMatch> {
     let mut in_function = false;
     let mut brace_depth: i32 = 0;
+    let mut func_start_line: usize = 0;
 
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim();
@@ -98,11 +109,10 @@ fn find_line_in_source(
         if !in_function {
             // Look for `function_name()` or `function_name ()`
             if trimmed.starts_with(function_name)
-                && trimmed[function_name.len()..]
-                    .trim_start()
-                    .starts_with('(')
+                && trimmed[function_name.len()..].trim_start().starts_with('(')
             {
                 in_function = true;
+                func_start_line = line_idx;
                 brace_depth += trimmed.matches('{').count() as i32;
                 brace_depth -= trimmed.matches('}').count() as i32;
                 continue;
@@ -123,7 +133,26 @@ fn find_line_in_source(
                 let indent = line_content.len() - line_content.trim_start().len();
                 let span_start = byte_start + indent;
                 let span_end = byte_start + line_content.len();
-                return Some((line_idx + 1, span_start, span_end));
+
+                // Find the function end by continuing to scan
+                let mut func_end_line = line_idx;
+                let mut depth = brace_depth;
+                for (i, l) in source.lines().enumerate().skip(line_idx + 1) {
+                    let t = l.trim();
+                    depth += t.matches('{').count() as i32;
+                    depth -= t.matches('}').count() as i32;
+                    func_end_line = i;
+                    if depth <= 0 {
+                        break;
+                    }
+                }
+
+                return Some(SourceMatch {
+                    byte_start: span_start,
+                    byte_end: span_end,
+                    func_start_line,
+                    func_end_line,
+                });
             }
 
             if brace_depth <= 0 {
@@ -134,12 +163,15 @@ fn find_line_in_source(
     None
 }
 
-/// Render an annotate-snippets diagnostic for the failing line.
+/// Render an annotate-snippets diagnostic for the failing line with surrounding context,
+/// clamped to the enclosing function boundaries.
 fn render_snippet(
     source_path: &Path,
     source: &str,
     byte_start: usize,
     byte_end: usize,
+    func_start_line: usize,
+    func_end_line: usize,
 ) {
     use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
 
@@ -148,14 +180,38 @@ fn render_snippet(
         .map(|n| n.to_string_lossy())
         .unwrap_or_else(|| source_path.to_string_lossy());
 
+    // Extract a window of context lines around the annotation, clamped to
+    // the enclosing function so we never leak into adjacent tests.
+    let context_lines = 3;
+    let lines: Vec<&str> = source.lines().collect();
+
+    // Find which line the annotation starts on (0-based)
+    let anno_line = source[..byte_start].matches('\n').count();
+
+    let window_start = anno_line.saturating_sub(context_lines).max(func_start_line);
+    let window_end = (anno_line + context_lines + 1)
+        .min(lines.len())
+        .min(func_end_line + 1);
+
+    // Byte offset where the window starts in the original source
+    let window_byte_start: usize = lines[..window_start]
+        .iter()
+        .map(|l| l.len() + 1) // +1 for newline
+        .sum();
+
+    let window_source: String = lines[window_start..window_end].join("\n");
+    let adj_start = byte_start - window_byte_start;
+    let adj_end = byte_end - window_byte_start;
+
     let report = &[Level::ERROR.primary_title("command failed").element(
-        Snippet::source(source)
+        Snippet::source(&window_source)
             .path(&*path_str)
-            .line_start(1)
-            .annotation(AnnotationKind::Primary.span(byte_start..byte_end)),
+            .line_start(window_start + 1)
+            .fold(false)
+            .annotation(AnnotationKind::Primary.span(adj_start..adj_end)),
     )];
 
-    let renderer = Renderer::plain();
+    let renderer = Renderer::styled();
     println!("{}", renderer.render(report));
 }
 
@@ -171,7 +227,10 @@ fn parse_bracket_expr(command: &str) -> Option<BracketExpr> {
 
     let op = parts[1];
     // Only handle comparison operators
-    if !matches!(op, "=" | "!=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge") {
+    if !matches!(
+        op,
+        "=" | "!=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
+    ) {
         return None;
     }
 
@@ -275,16 +334,17 @@ mod tests {
 
     #[test]
     fn find_line_in_function() {
-        let source = "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo hello\n  [ ABC = DEF ]\n}\n";
-        let (lineno, start, end) = find_line_in_source(source, "test_foo", "[ ABC = DEF ]").unwrap();
-        assert_eq!(lineno, 7);
-        assert_eq!(&source[start..end], "[ ABC = DEF ]");
+        let source =
+            "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo hello\n  [ ABC = DEF ]\n}\n";
+        let m = find_line_in_source(source, "test_foo", "[ ABC = DEF ]").unwrap();
+        assert_eq!(&source[m.byte_start..m.byte_end], "[ ABC = DEF ]");
+        assert_eq!(m.func_start_line, 4); // 0-based: "test_foo() {"
+        assert_eq!(m.func_end_line, 7); // 0-based: "}"
     }
 
     #[test]
     fn find_line_not_in_wrong_function() {
-        let source =
-            "test_a() {\n  echo hello\n}\n\ntest_b() {\n  echo world\n}\n";
+        let source = "test_a() {\n  echo hello\n}\n\ntest_b() {\n  echo world\n}\n";
         assert!(find_line_in_source(source, "test_b", "echo hello").is_none());
     }
 }

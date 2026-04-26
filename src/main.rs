@@ -12,7 +12,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::engine::ArgValueCompleter;
 
 #[derive(Parser)]
-#[command(name = "attest", about = "Shell-based test framework")]
+#[command(version, name = "attest", about = "Shell-based test framework")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -42,6 +42,10 @@ struct Cli {
     #[arg(long)]
     bail: bool,
 
+    /// Print xtrace output from tests as they run (one test at a time)
+    #[arg(short = 'x', long)]
+    xtrace: bool,
+
     /// Prepend a directory to $PATH for tests (can be specified multiple times)
     #[arg(long)]
     add_path: Vec<PathBuf>,
@@ -49,6 +53,10 @@ struct Cli {
     /// Trace a command with strace, saving output to the test context dir (can be specified multiple times)
     #[arg(long)]
     strace: Vec<String>,
+
+    /// Enable debug logging
+    #[arg(short = 'd', long)]
+    debug: bool,
 }
 
 #[derive(Subcommand)]
@@ -121,11 +129,7 @@ fn complete_tests(current: &std::ffi::OsStr) -> Vec<clap_complete::engine::Compl
     let cwd = Path::new(".");
     if let Ok(files) = discovery::discover_test_files(cwd) {
         for file in &files {
-            let rel = file
-                .strip_prefix(cwd)
-                .unwrap_or(file)
-                .display()
-                .to_string();
+            let rel = file.strip_prefix(cwd).unwrap_or(file).display().to_string();
             let rel = rel.strip_prefix("./").unwrap_or(&rel).to_string();
 
             if rel.starts_with(&*current) {
@@ -149,11 +153,14 @@ fn complete_tests(current: &std::ffi::OsStr) -> Vec<clap_complete::engine::Compl
 fn main() -> anyhow::Result<()> {
     clap_complete::CompleteEnv::with_factory(Cli::command).complete();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
+
+    let env_filter = if cli.debug {
+        tracing_subscriber::EnvFilter::new("debug")
+    } else {
+        tracing_subscriber::EnvFilter::from_default_env()
+    };
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     match cli.command {
         Some(Commands::Skill) => {
@@ -205,13 +212,18 @@ fn main() -> anyhow::Result<()> {
             let config = runner::RunConfig {
                 parallel: cli.parallel,
                 bail: cli.bail,
+                xtrace: cli.xtrace,
                 results: cli.results,
                 results_failed: cli.results_failed,
                 add_path: cli.add_path,
                 strace: cli.strace,
             };
 
-            let test_refs: Vec<(&str, &[brush_parser::ast::FunctionDefinition], &std::path::Path)> = all_tests
+            let test_refs: Vec<(
+                &str,
+                &[brush_parser::ast::FunctionDefinition],
+                &std::path::Path,
+            )> = all_tests
                 .iter()
                 .map(|(name, funcs, src)| (name.as_str(), funcs.as_slice(), src.as_path()))
                 .collect();

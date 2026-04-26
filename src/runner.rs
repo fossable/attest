@@ -1,9 +1,100 @@
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use brush_parser::ast::FunctionDefinition;
 
 use crate::output;
+
+/// Tracks live xtrace streaming state: which test holds the output lock and how
+/// far we've read into its xtrace.log.
+struct XtraceStreamer {
+    /// Name of the test currently holding the xtrace output lock.
+    holder: Option<String>,
+    /// File handle for the current holder's xtrace.log.
+    file: Option<std::fs::File>,
+    /// How many bytes have been printed so far.
+    offset: u64,
+}
+
+impl XtraceStreamer {
+    fn new() -> Self {
+        Self {
+            holder: None,
+            file: None,
+            offset: 0,
+        }
+    }
+
+    /// Acquire the lock for a test if no one currently holds it.
+    fn try_acquire(&mut self, pending: &PendingTest) {
+        if self.holder.is_some() {
+            return;
+        }
+        let xtrace_path = pending.tmp_dir.as_ref().unwrap().join("xtrace.log");
+        if let Ok(f) = std::fs::File::open(&xtrace_path) {
+            eprintln!("\x1b[2m--- xtrace: {} ---\x1b[0m", pending.name);
+            self.holder = Some(pending.name.clone());
+            self.file = Some(f);
+            self.offset = 0;
+        }
+    }
+
+    /// Check whether the current holder's xtrace.log has new data.
+    fn has_new(&mut self) -> bool {
+        let Some(ref mut f) = self.file else {
+            return false;
+        };
+        f.metadata().map_or(false, |m| m.len() > self.offset)
+    }
+
+    /// Print any new bytes from the current holder's xtrace.log.
+    fn flush_new(&mut self) {
+        let Some(ref mut f) = self.file else { return };
+        if f.seek(SeekFrom::Start(self.offset)).is_err() {
+            return;
+        }
+        let mut buf = Vec::new();
+        if f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+            self.offset += buf.len() as u64;
+            use std::io::Write;
+            let _ = write!(std::io::stderr(), "\x1b[2m");
+            let _ = std::io::stderr().write_all(&buf);
+            let _ = write!(std::io::stderr(), "\x1b[0m");
+        }
+    }
+
+    /// Release the lock (flush remaining output first).
+    fn release(&mut self) {
+        self.flush_new();
+        self.holder = None;
+        self.file = None;
+        self.offset = 0;
+    }
+
+    /// Check if the named test currently holds the lock.
+    fn is_holder(&self, name: &str) -> bool {
+        self.holder.as_deref() == Some(name)
+    }
+
+    /// Dump the full xtrace log for a test that was never streamed (e.g. it
+    /// finished before the parent could open the file).
+    fn dump_missed(&self, pending: &PendingTest) {
+        if self.is_holder(&pending.name) {
+            return; // Will be flushed via release()
+        }
+        let xtrace_path = pending.tmp_dir.as_ref().unwrap().join("xtrace.log");
+        if let Ok(content) = std::fs::read(&xtrace_path) {
+            if !content.is_empty() {
+                use std::io::Write;
+                eprintln!("\x1b[2m--- xtrace: {} ---\x1b[0m", pending.name);
+                let _ = write!(std::io::stderr(), "\x1b[2m");
+                let _ = std::io::stderr().write_all(&content);
+                let _ = write!(std::io::stderr(), "\x1b[0m");
+            }
+        }
+    }
+}
 
 pub struct TestResult {
     pub name: String,
@@ -49,6 +140,7 @@ impl Drop for PendingTest {
 pub struct RunConfig {
     pub parallel: usize,
     pub bail: bool,
+    pub xtrace: bool,
     pub results: Option<PathBuf>,
     pub results_failed: Option<PathBuf>,
     pub add_path: Vec<PathBuf>,
@@ -62,11 +154,17 @@ pub fn run_all_tests(
     let mut results = Vec::new();
     let total = tests.len();
     let status = output::StatusDisplay::new(total);
+    let wall_start = Instant::now();
 
     let max_parallel = config.parallel.max(1);
     let mut test_iter = tests.iter();
     let mut pending_list: Vec<PendingTest> = Vec::new();
     let mut bail_flag = false;
+    let mut xtrace = if config.xtrace {
+        Some(XtraceStreamer::new())
+    } else {
+        None
+    };
 
     // Seed the initial batch up to max_parallel.
     while pending_list.len() < max_parallel {
@@ -83,8 +181,22 @@ pub fn run_all_tests(
         }
     }
 
+    // If xtrace is enabled, acquire the lock for the first pending test.
+    if let Some(ref mut xt) = xtrace {
+        if let Some(p) = pending_list.first() {
+            status.suspend(|| xt.try_acquire(p));
+        }
+    }
+
     // Poll loop: non-blocking reap, process completions, update status.
     while !pending_list.is_empty() {
+        // Stream xtrace output from the current holder.
+        if let Some(ref mut xt) = xtrace {
+            if xt.has_new() {
+                status.suspend(|| xt.flush_new());
+            }
+        }
+
         // Non-blocking reap: check all pending tests with WNOHANG.
         let mut reaped: Vec<(usize, libc::c_int)> = Vec::new();
         for (i, pending) in pending_list.iter().enumerate() {
@@ -105,6 +217,17 @@ pub fn run_all_tests(
         reaped.sort_by(|a, b| b.0.cmp(&a.0));
         let mut completed: Vec<TestResult> = Vec::new();
         for (i, exit_status) in reaped {
+            if let Some(ref mut xt) = xtrace {
+                // If this test held the xtrace lock, release it (flushes remaining output).
+                // Otherwise dump the full log for tests that finished before we could stream.
+                status.suspend(|| {
+                    if xt.is_holder(&pending_list[i].name) {
+                        xt.release();
+                    } else {
+                        xt.dump_missed(&pending_list[i]);
+                    }
+                });
+            }
             let mut pending = pending_list.remove(i);
             if bail_flag {
                 continue; // Drop kills + cleans up
@@ -141,10 +264,29 @@ pub fn run_all_tests(
             break;
         }
 
+        // If xtrace lock is free, acquire the next pending test.
+        if let Some(ref mut xt) = xtrace {
+            if xt.holder.is_none() {
+                if let Some(p) = pending_list.first() {
+                    status.suspend(|| xt.try_acquire(p));
+                }
+            }
+        }
+
         // Update status line with currently running tests.
         let running: Vec<(&str, std::time::Duration)> = pending_list
             .iter()
-            .map(|p| (p.name.as_str(), p.start.elapsed()))
+            .map(|p| {
+                #[cfg(feature = "cgroup")]
+                let duration = p
+                    .cgroup
+                    .as_ref()
+                    .and_then(|cg| cg.read_cpu_time())
+                    .unwrap_or_else(|| p.start.elapsed());
+                #[cfg(not(feature = "cgroup"))]
+                let duration = p.start.elapsed();
+                (p.name.as_str(), duration)
+            })
             .collect();
         status.update(&running, results.len());
 
@@ -160,7 +302,7 @@ pub fn run_all_tests(
         copy_results_dirs(&results, dir, true)?;
     }
 
-    output::print_summary(&results);
+    output::print_summary(&results, wall_start.elapsed());
     Ok(results)
 }
 
@@ -231,10 +373,7 @@ fn fork_test(
             // image entirely. Passing source_path as argv[0] makes $0 inside
             // the test functions refer to the original script, not the runner.
             use std::os::unix::process::CommandExt;
-            let source_str = source_path_owned
-                .to_str()
-                .unwrap_or("sh")
-                .to_string();
+            let source_str = source_path_owned.to_str().unwrap_or("sh").to_string();
             let err = std::process::Command::new("/bin/sh")
                 .args(["-c", &runner_content, &source_str])
                 .exec();
@@ -317,11 +456,12 @@ fn build_runner_script(
         stdout.display(),
         xtrace.display()
     ));
-    s.push_str("PS4='+$LINENO: '\n");
-    s.push_str("set -ex\n");
+    s.push_str("set -e\n");
 
-    // Source function definitions, then invoke the test function.
+    // Source function definitions, then enable xtrace and invoke the test function.
     s.push_str(&format!(". {}\n", functions_path.display()));
+    s.push_str("PS4='+$LINENO: '\n");
+    s.push_str("set -x\n");
     s.push_str(test_name);
     s.push('\n');
 
@@ -555,6 +695,7 @@ mod tests {
         let config = RunConfig {
             parallel: 1,
             bail: false,
+            xtrace: false,
             results: None,
             results_failed: None,
             add_path: vec![],
@@ -564,7 +705,13 @@ mod tests {
         let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
             .tests
             .iter()
-            .map(|t| (t.name.as_str(), test_file.functions.as_slice(), path.as_path()))
+            .map(|t| {
+                (
+                    t.name.as_str(),
+                    test_file.functions.as_slice(),
+                    path.as_path(),
+                )
+            })
             .collect();
 
         let results = run_all_tests(test_refs, &config).unwrap();
@@ -585,6 +732,7 @@ mod tests {
         let config = RunConfig {
             parallel: 1,
             bail: true,
+            xtrace: false,
             results: None,
             results_failed: None,
             add_path: vec![],
@@ -594,7 +742,13 @@ mod tests {
         let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
             .tests
             .iter()
-            .map(|t| (t.name.as_str(), test_file.functions.as_slice(), path.as_path()))
+            .map(|t| {
+                (
+                    t.name.as_str(),
+                    test_file.functions.as_slice(),
+                    path.as_path(),
+                )
+            })
             .collect();
 
         let results = run_all_tests(test_refs, &config).unwrap();
@@ -615,6 +769,7 @@ mod tests {
         let config = RunConfig {
             parallel: 0,
             bail: false,
+            xtrace: false,
             results: None,
             results_failed: None,
             add_path: vec![],
@@ -624,7 +779,13 @@ mod tests {
         let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
             .tests
             .iter()
-            .map(|t| (t.name.as_str(), test_file.functions.as_slice(), path.as_path()))
+            .map(|t| {
+                (
+                    t.name.as_str(),
+                    test_file.functions.as_slice(),
+                    path.as_path(),
+                )
+            })
             .collect();
 
         let results = run_all_tests(test_refs, &config).unwrap();

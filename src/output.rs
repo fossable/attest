@@ -19,7 +19,7 @@ impl StatusDisplay {
             let bar = ProgressBar::new(total as u64);
             bar.set_style(
                 ProgressStyle::default_bar()
-                    .template("Testing {pos}/{len}: [{msg}]")
+                    .template("\x1b[1;32mTesting\x1b[0m {pos}/{len}: [{msg}]")
                     .unwrap(),
             );
             bar.enable_steady_tick(Duration::from_millis(250));
@@ -127,10 +127,9 @@ fn format_bytes(b: u64) -> String {
     }
 }
 
-pub fn print_summary(results: &[TestResult]) {
+pub fn print_summary(results: &[TestResult], wall_duration: Duration) {
     let passed = results.iter().filter(|r| r.passed).count();
     let failed = results.len() - passed;
-    let total_duration: Duration = results.iter().map(|r| r.duration).sum();
 
     println!();
     if failed > 0 {
@@ -144,7 +143,7 @@ pub fn print_summary(results: &[TestResult]) {
             results.len()
         );
     }
-    println!("Time:   {}", format_duration(total_duration));
+    println!("Time:   {}", format_duration(wall_duration));
 }
 
 pub fn print_test_list(tests: &[TestCase]) {

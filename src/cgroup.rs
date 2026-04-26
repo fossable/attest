@@ -72,6 +72,14 @@ impl TestCgroup {
         }
     }
 
+    /// Read total CPU time (user + system) from the cgroup. Returns `None`
+    /// when the cpu controller is unavailable.
+    pub fn read_cpu_time(&self) -> Option<std::time::Duration> {
+        let user = read_stat_field(self.path.join("cpu.stat"), "user_usec")?;
+        let system = read_stat_field(self.path.join("cpu.stat"), "system_usec").unwrap_or(0);
+        Some(std::time::Duration::from_micros(user + system))
+    }
+
     /// Read resource stats from the cgroup pseudo-files. Call this after the
     /// child has exited (waitpid returned) but before dropping the handle.
     pub fn read_stats(&self) -> ResourceStats {
@@ -149,20 +157,17 @@ fn init_attest_base() -> Option<PathBuf> {
 
         if probe_ok {
             for ctrl in ["cpu", "memory", "io", "pids"] {
-                let _ = std::fs::write(
-                    ancestor.join("cgroup.subtree_control"),
-                    format!("+{ctrl}"),
-                );
-                let _ = std::fs::write(
-                    base.join("cgroup.subtree_control"),
-                    format!("+{ctrl}"),
-                );
+                let _ = std::fs::write(ancestor.join("cgroup.subtree_control"), format!("+{ctrl}"));
+                let _ = std::fs::write(base.join("cgroup.subtree_control"), format!("+{ctrl}"));
             }
             tracing::debug!("cgroup base: {}", base.display());
             return Some(base);
         }
 
-        tracing::debug!("cgroup.procs probe failed at {}; trying parent", base.display());
+        tracing::debug!(
+            "cgroup.procs probe failed at {}; trying parent",
+            base.display()
+        );
         let _ = std::fs::remove_dir(&base); // may fail if non-empty, that's ok
         match ancestor.parent() {
             Some(p) if p != Path::new("/sys/fs/cgroup") => ancestor = p.to_path_buf(),
