@@ -46,13 +46,25 @@ struct Cli {
     #[arg(short = 'x', long)]
     xtrace: bool,
 
-    /// Prepend a directory to $PATH for tests (can be specified multiple times)
+    /// Override a command by copying its resolved binary into the test context bin/ dir (can be specified multiple times)
     #[arg(long)]
-    add_path: Vec<PathBuf>,
+    r#override: Vec<String>,
 
     /// Trace a command with strace, saving output to the test context dir (can be specified multiple times)
     #[arg(long)]
     strace: Vec<String>,
+
+    /// Run tests inside the specified Docker container image
+    #[arg(long)]
+    docker: Option<String>,
+
+    /// Kill a test and mark it as timed out after this many seconds (wall-clock time)
+    #[arg(long)]
+    timeout: Option<f64>,
+
+    /// Print results as JSONL (one JSON object per test) instead of terminal output
+    #[arg(long)]
+    json: bool,
 
     /// Enable debug logging
     #[arg(short = 'd', long)]
@@ -213,10 +225,13 @@ fn main() -> anyhow::Result<()> {
                 parallel: cli.parallel,
                 bail: cli.bail,
                 xtrace: cli.xtrace,
+                json: cli.json,
                 results: cli.results,
                 results_failed: cli.results_failed,
-                add_path: cli.add_path,
+                override_cmds: cli.r#override,
                 strace: cli.strace,
+                docker: cli.docker,
+                timeout: cli.timeout.map(std::time::Duration::from_secs_f64),
             };
 
             let test_refs: Vec<(

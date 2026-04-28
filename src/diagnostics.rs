@@ -75,13 +75,13 @@ fn parse_xtrace_failure(tmp_dir: &Path) -> Option<FailureInfo> {
             if rest.starts_with('+') {
                 continue;
             }
-            if let Some((lineno_str, command)) = rest.split_once(": ") {
-                if let Ok(lineno) = lineno_str.trim().parse::<usize>() {
-                    last_match = Some(FailureInfo {
-                        lineno,
-                        command: command.to_string(),
-                    });
-                }
+            if let Some((lineno_str, command)) = rest.split_once(": ")
+                && let Ok(lineno) = lineno_str.trim().parse::<usize>()
+            {
+                last_match = Some(FailureInfo {
+                    lineno,
+                    command: command.to_string(),
+                });
             }
         }
     }

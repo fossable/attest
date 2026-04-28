@@ -9,10 +9,15 @@
   AST to extract all `FunctionDefinition` nodes. Test functions start with
   `test`.
 - `src/runner.rs` - For each test: writes all extracted functions (test +
-  helper) to a temp script, creates a `brush_core::Shell` with `brush_builtins`,
-  redirects stdout/stderr to log files, enables xtrace (`set -ex`), sources the
-  script, then invokes the test function by name. Parallel by default via
-  `fork(2)` with configurable parallelism (`--parallel`).
+  helper) to a temp script, forks a child that execs `/bin/sh -c`, redirects
+  stdout to `stdout.log` and stderr to `xtrace.log`, enables `set -ex`, sources
+  the script, then invokes the test function by name. Parallel by default via
+  `fork(2)` with configurable parallelism (`--parallel`). Supports
+  `--timeout`, `--bail`, `--override`, `--strace`, and `--docker`.
+- `src/diagnostics.rs` - On failure, parses `xtrace.log` to find the last
+  executed command, maps it back to the original source file, and renders an
+  annotate-snippets error snippet. Also shows inline character-level diffs for
+  failed `[ A = B ]` assertions.
 - `src/output.rs` - ANSI-colored terminal output for PASS/FAIL and summary.
 
 ## Key dependencies
@@ -31,21 +36,14 @@ function is an implicit assertion - if it exits nonzero, the test fails.
 Non-test functions (helpers/setup) are also extracted and made available to
 tests.
 
-## TODO list
+## CLI options
 
-- Refine the runner UI
-  - With a tty attached, the last line continuously updates 4 times per second
-    for example: "Testing 2/30: [testHelp(10ms), testVersion(52ms)]" where the
-    currently executing test is shown with the total CPU time reported by the
-    test's cgroup.
-  - When a test fails, render a snippet of the test's source code where it
-    failed in the terminal. Find a dependency similar to Python's rich library
-    to do this.
-    - If the line that failed is a `[`, then parse the operands to render rich
-      inforation about the failure. For example for the failed command:
-      `[ "AABB" = "BBBB" ]`, show a diff of the two operands.
-  - With xtrace mode (-x), print each test's xtrace output to the terminal as
-    it's produced. Create a lock to prevent interleaving output from multiple
-    tests. Only one test is allowed to incrementally print xtrace output at a
-    time.
-  - With debug mode (-d), increase the log level to DEBUG.
+- `--parallel N` — max concurrent tests (default: CPU cores)
+- `--timeout SECS` — wall-clock timeout per test; timed-out tests show `TIME` and count as failures
+- `--bail` — stop after first failure
+- `--filter [FILE/]PATTERN` — run only matching tests (`*` wildcards, prefix match)
+- `--override CMD` — copy the resolved binary into `bin/` so tests use it exclusively
+- `--strace CMD` — wrap CMD with strace, output saved to `strace/CMD.log` in the test context dir
+- `--docker IMAGE` — run each test inside a Docker container with the test context dir mounted at `/attest`
+- `--xtrace` — stream xtrace output live (one test at a time)
+- `--results DIR` / `--results-failed DIR` — copy test context dirs to DIR on exit

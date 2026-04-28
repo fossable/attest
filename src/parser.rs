@@ -68,15 +68,15 @@ impl TestPattern {
     }
 
     pub fn matches(&self, test: &TestCase) -> bool {
-        if let Some(ref file_pat) = self.file {
-            if !test.file.ends_with(file_pat) {
-                return false;
-            }
+        if let Some(ref file_pat) = self.file
+            && !test.file.ends_with(file_pat)
+        {
+            return false;
         }
-        if let Some(ref name_pat) = self.name {
-            if !wildcard_match(name_pat, &test.name) {
-                return false;
-            }
+        if let Some(ref name_pat) = self.name
+            && !wildcard_match(name_pat, &test.name)
+        {
+            return false;
         }
         true
     }

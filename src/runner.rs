@@ -45,7 +45,7 @@ impl XtraceStreamer {
         let Some(ref mut f) = self.file else {
             return false;
         };
-        f.metadata().map_or(false, |m| m.len() > self.offset)
+        f.metadata().is_ok_and(|m| m.len() > self.offset)
     }
 
     /// Print any new bytes from the current holder's xtrace.log.
@@ -84,14 +84,14 @@ impl XtraceStreamer {
             return; // Will be flushed via release()
         }
         let xtrace_path = pending.tmp_dir.as_ref().unwrap().join("xtrace.log");
-        if let Ok(content) = std::fs::read(&xtrace_path) {
-            if !content.is_empty() {
-                use std::io::Write;
-                eprintln!("\x1b[2m--- xtrace: {} ---\x1b[0m", pending.name);
-                let _ = write!(std::io::stderr(), "\x1b[2m");
-                let _ = std::io::stderr().write_all(&content);
-                let _ = write!(std::io::stderr(), "\x1b[0m");
-            }
+        if let Ok(content) = std::fs::read(&xtrace_path)
+            && !content.is_empty()
+        {
+            use std::io::Write;
+            eprintln!("\x1b[2m--- xtrace: {} ---\x1b[0m", pending.name);
+            let _ = write!(std::io::stderr(), "\x1b[2m");
+            let _ = std::io::stderr().write_all(&content);
+            let _ = write!(std::io::stderr(), "\x1b[0m");
         }
     }
 }
@@ -99,6 +99,7 @@ impl XtraceStreamer {
 pub struct TestResult {
     pub name: String,
     pub passed: bool,
+    pub timed_out: bool,
     pub duration: Duration,
     pub tmp_dir: PathBuf,
     pub source_path: PathBuf,
@@ -112,6 +113,8 @@ struct PendingTest {
     pid: libc::pid_t,
     /// Set to `true` once `waitpid` has reaped the child so `Drop` skips it.
     reaped: bool,
+    /// Set to `true` when the child was killed due to exceeding `--timeout`.
+    timed_out: bool,
     name: String,
     start: Instant,
     /// `None` after the path has been transferred to `TestResult`.
@@ -141,10 +144,14 @@ pub struct RunConfig {
     pub parallel: usize,
     pub bail: bool,
     pub xtrace: bool,
+    pub json: bool,
     pub results: Option<PathBuf>,
     pub results_failed: Option<PathBuf>,
-    pub add_path: Vec<PathBuf>,
+    pub override_cmds: Vec<String>,
     pub strace: Vec<String>,
+    pub docker: Option<String>,
+    /// Wall-clock timeout per test. Tests exceeding this are killed and marked as timed out.
+    pub timeout: Option<Duration>,
 }
 
 pub fn run_all_tests(
@@ -153,7 +160,7 @@ pub fn run_all_tests(
 ) -> anyhow::Result<Vec<TestResult>> {
     let mut results = Vec::new();
     let total = tests.len();
-    let status = output::StatusDisplay::new(total);
+    let status = output::StatusDisplay::new(total, config.json);
     let wall_start = Instant::now();
 
     let max_parallel = config.parallel.max(1);
@@ -173,8 +180,9 @@ pub fn run_all_tests(
                 test_name,
                 all_functions,
                 source_path,
-                &config.add_path,
+                &config.override_cmds,
                 &config.strace,
+                config.docker.as_deref(),
             )?);
         } else {
             break;
@@ -182,18 +190,28 @@ pub fn run_all_tests(
     }
 
     // If xtrace is enabled, acquire the lock for the first pending test.
-    if let Some(ref mut xt) = xtrace {
-        if let Some(p) = pending_list.first() {
-            status.suspend(|| xt.try_acquire(p));
-        }
+    if let Some(ref mut xt) = xtrace
+        && let Some(p) = pending_list.first()
+    {
+        status.suspend(|| xt.try_acquire(p));
     }
 
     // Poll loop: non-blocking reap, process completions, update status.
     while !pending_list.is_empty() {
         // Stream xtrace output from the current holder.
-        if let Some(ref mut xt) = xtrace {
-            if xt.has_new() {
-                status.suspend(|| xt.flush_new());
+        if let Some(ref mut xt) = xtrace
+            && xt.has_new()
+        {
+            status.suspend(|| xt.flush_new());
+        }
+
+        // Kill any tests that have exceeded the wall-clock timeout.
+        if let Some(timeout) = config.timeout {
+            for pending in pending_list.iter_mut() {
+                if !pending.timed_out && pending.start.elapsed() > timeout {
+                    unsafe { libc::kill(pending.pid, libc::SIGKILL) };
+                    pending.timed_out = true;
+                }
             }
         }
 
@@ -241,22 +259,25 @@ pub fn run_all_tests(
         // Sort completed by name for deterministic output within a reap batch.
         completed.sort_by(|a, b| a.name.cmp(&b.name));
         for result in completed {
-            status.suspend(|| output::print_test_result(&result));
+            if config.json {
+                output::print_test_result_json(&result);
+            } else {
+                status.suspend(|| output::print_test_result(&result));
+            }
             if !result.passed && config.bail {
                 bail_flag = true;
             }
             results.push(result);
 
-            if !bail_flag {
-                if let Some((test_name, all_functions, source_path)) = test_iter.next() {
-                    pending_list.push(fork_test(
-                        test_name,
-                        all_functions,
-                        source_path,
-                        &config.add_path,
-                        &config.strace,
-                    )?);
-                }
+            if !bail_flag && let Some((test_name, all_functions, source_path)) = test_iter.next() {
+                pending_list.push(fork_test(
+                    test_name,
+                    all_functions,
+                    source_path,
+                    &config.override_cmds,
+                    &config.strace,
+                    config.docker.as_deref(),
+                )?);
             }
         }
 
@@ -265,12 +286,11 @@ pub fn run_all_tests(
         }
 
         // If xtrace lock is free, acquire the next pending test.
-        if let Some(ref mut xt) = xtrace {
-            if xt.holder.is_none() {
-                if let Some(p) = pending_list.first() {
-                    status.suspend(|| xt.try_acquire(p));
-                }
-            }
+        if let Some(ref mut xt) = xtrace
+            && xt.holder.is_none()
+            && let Some(p) = pending_list.first()
+        {
+            status.suspend(|| xt.try_acquire(p));
         }
 
         // Update status line with currently running tests.
@@ -302,7 +322,9 @@ pub fn run_all_tests(
         copy_results_dirs(&results, dir, true)?;
     }
 
-    output::print_summary(&results, wall_start.elapsed());
+    if !config.json {
+        output::print_summary(&results, wall_start.elapsed());
+    }
     Ok(results)
 }
 
@@ -312,8 +334,9 @@ fn fork_test(
     test_name: &str,
     all_functions: &[FunctionDefinition],
     source_path: &Path,
-    add_path: &[PathBuf],
+    override_cmds: &[String],
     strace: &[String],
+    docker: Option<&str>,
 ) -> anyhow::Result<PendingTest> {
     let tmp_dir = tempfile::TempDir::new()?;
     let tmp_path = tmp_dir.keep();
@@ -327,6 +350,12 @@ fn fork_test(
     }
     std::fs::write(&script_path, &script)?;
 
+    // Always create bin/ dir; populate it with override binaries if requested.
+    std::fs::create_dir_all(tmp_path.join("bin"))?;
+    if !override_cmds.is_empty() {
+        create_override_bins(&tmp_path, override_cmds)?;
+    }
+
     if !strace.is_empty() {
         create_strace_wrappers(&tmp_path, strace)?;
     }
@@ -337,8 +366,8 @@ fn fork_test(
     let source_path_owned = source_path
         .canonicalize()
         .unwrap_or_else(|_| source_path.to_path_buf());
-    let add_path_owned = add_path.to_vec();
     let strace_owned = strace.to_vec();
+    let docker_owned = docker.map(|s| s.to_string());
     let tmp_path_child = tmp_path.clone();
 
     #[cfg(feature = "cgroup")]
@@ -361,18 +390,50 @@ fn fork_test(
                 cg.enter();
             }
 
+            use std::os::unix::process::CommandExt;
+
+            if let Some(ref image) = docker_owned {
+                // Docker mode: write a runner script with container-internal paths,
+                // then exec `docker run` mounting the tmp dir as /attest.
+                let container_dir = Path::new("/attest");
+                let container_functions = container_dir.join("functions.sh");
+                let runner_content = build_runner_script(
+                    &test_name_owned,
+                    &container_functions,
+                    container_dir,
+                    &[], // strace wrappers reference host paths; skip in docker mode
+                );
+                let runner_path = tmp_path_child.join("runner.sh");
+                if let Err(e) = std::fs::write(&runner_path, &runner_content) {
+                    eprintln!("failed to write runner.sh: {e}");
+                    unsafe { libc::_exit(1) };
+                }
+                let mount = format!("{}:/attest", tmp_path_child.display());
+                let err = std::process::Command::new("docker")
+                    .args([
+                        "run",
+                        "--rm",
+                        "-v",
+                        &mount,
+                        image,
+                        "/bin/sh",
+                        "/attest/runner.sh",
+                    ])
+                    .exec();
+                eprintln!("exec docker failed: {err}");
+                unsafe { libc::_exit(1) };
+            }
+
             let runner_content = build_runner_script(
                 &test_name_owned,
                 &script_path,
                 &tmp_path_child,
-                &add_path_owned,
                 &strace_owned,
             );
 
             // Exec /bin/sh -c <script> <source_path>: replaces this child
             // image entirely. Passing source_path as argv[0] makes $0 inside
             // the test functions refer to the original script, not the runner.
-            use std::os::unix::process::CommandExt;
             let source_str = source_path_owned.to_str().unwrap_or("sh").to_string();
             let err = std::process::Command::new("/bin/sh")
                 .args(["-c", &runner_content, &source_str])
@@ -385,6 +446,7 @@ fn fork_test(
             Ok(PendingTest {
                 pid: child_pid,
                 reaped: false,
+                timed_out: false,
                 name: test_name.to_string(),
                 start,
                 tmp_dir: Some(tmp_path),
@@ -400,7 +462,8 @@ fn fork_test(
 /// reaped with the given raw `waitpid` status.
 fn build_result(mut pending: PendingTest, status: libc::c_int) -> TestResult {
     let duration = pending.start.elapsed();
-    let passed = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    let timed_out = pending.timed_out;
+    let passed = !timed_out && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
 
     // Read stats before dropping cgroup (which removes the directory).
     #[cfg(feature = "cgroup")]
@@ -411,6 +474,7 @@ fn build_result(mut pending: PendingTest, status: libc::c_int) -> TestResult {
     TestResult {
         name: pending.name.clone(),
         passed,
+        timed_out,
         duration,
         tmp_dir,
         source_path: pending.source_path.clone(),
@@ -428,24 +492,18 @@ fn build_runner_script(
     test_name: &str,
     functions_path: &Path,
     working_dir: &Path,
-    add_path: &[PathBuf],
     strace: &[String],
 ) -> String {
     let mut s = String::new();
 
-    // Strace wrappers dir must precede add_path so wrappers intercept calls.
+    // bin/ is always first so --override binaries take precedence.
+    let bin_dir = working_dir.join("bin");
+    s.push_str(&format!("export PATH={}:$PATH\n", bin_dir.display()));
+
+    // Strace wrappers dir must precede bin/ so wrappers intercept calls.
     if !strace.is_empty() {
         let strace_bin = working_dir.join("strace_bin");
         s.push_str(&format!("export PATH={}:$PATH\n", strace_bin.display()));
-    }
-
-    if !add_path.is_empty() {
-        let prefix = add_path
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(":");
-        s.push_str(&format!("export PATH={prefix}:$PATH\n"));
     }
 
     // Redirect both stdout and stderr to log files, then enable xtrace.
@@ -490,6 +548,20 @@ fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> anyhow::Re
         );
         std::fs::write(&wrapper, script)?;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    Ok(())
+}
+
+fn create_override_bins(working_dir: &Path, commands: &[String]) -> anyhow::Result<()> {
+    let bin_dir = working_dir.join("bin");
+    std::fs::create_dir_all(&bin_dir)?;
+
+    for cmd in commands {
+        let src = which::which(cmd)
+            .map_err(|_| anyhow::anyhow!("--override: command not found: {cmd}"))?;
+        let dst = bin_dir.join(cmd);
+        std::fs::copy(&src, &dst)?;
     }
 
     Ok(())
@@ -555,7 +627,7 @@ mod tests {
         let path = tmp.path().join("t.sh");
         fs::write(&path, script).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
-        let pending = fork_test(test_name, &tf.functions, &path, &[], &[]).unwrap();
+        let pending = fork_test(test_name, &tf.functions, &path, &[], &[], None).unwrap();
         wait_and_collect(pending)
     }
 
@@ -585,18 +657,26 @@ mod tests {
     }
 
     #[test]
-    fn execute_test_with_add_path() {
+    fn execute_test_with_override() {
+        // Override `true` (always succeeds) to verify the copy lands in bin/ and runs.
         let tmp = TempDir::new().unwrap();
-        let bin_dir = tmp.path().join("mybin");
-        fs::create_dir(&bin_dir).unwrap();
-
-        let script_content = "test_path() {\n  echo \"$PATH\" | grep -q mybin\n}\n";
+        let script_content = "test_override() {\n  true\n}\n";
         let path = tmp.path().join("t.sh");
         fs::write(&path, script_content).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
-        let pending = fork_test("test_path", &tf.functions, &path, &[bin_dir], &[]).unwrap();
+        let pending = fork_test(
+            "test_override",
+            &tf.functions,
+            &path,
+            &["true".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
         let result = wait_and_collect(pending);
         assert!(result.passed);
+        // bin/true should exist in the context dir
+        assert!(result.tmp_dir.join("bin/true").exists());
     }
 
     #[test]
@@ -634,6 +714,7 @@ mod tests {
         let results = vec![TestResult {
             name: "test_failure".to_string(),
             passed: false,
+            timed_out: false,
             duration: Duration::from_millis(10),
             tmp_dir: test_tmp.clone(),
             source_path: PathBuf::from("test.sh"),
@@ -696,10 +777,13 @@ mod tests {
             parallel: 1,
             bail: false,
             xtrace: false,
+            json: false,
             results: None,
             results_failed: None,
-            add_path: vec![],
+            override_cmds: vec![],
             strace: vec![],
+            docker: None,
+            timeout: None,
         };
 
         let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
@@ -733,10 +817,13 @@ mod tests {
             parallel: 1,
             bail: true,
             xtrace: false,
+            json: false,
             results: None,
             results_failed: None,
-            add_path: vec![],
+            override_cmds: vec![],
             strace: vec![],
+            docker: None,
+            timeout: None,
         };
 
         let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
@@ -770,10 +857,13 @@ mod tests {
             parallel: 0,
             bail: false,
             xtrace: false,
+            json: false,
             results: None,
             results_failed: None,
-            add_path: vec![],
+            override_cmds: vec![],
             strace: vec![],
+            docker: None,
+            timeout: None,
         };
 
         let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
@@ -792,6 +882,40 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|r| r.passed));
         assert!(results.iter().any(|r| !r.passed));
+    }
+
+    #[test]
+    fn timeout_kills_slow_test() {
+        let tmp = TempDir::new().unwrap();
+        let script_content = "test_slow() {\n  sleep 60\n}\n";
+
+        let path = tmp.path().join("test.sh");
+        fs::write(&path, script_content).unwrap();
+        let tf = crate::parser::parse_test_file(&path).unwrap();
+
+        let config = RunConfig {
+            parallel: 1,
+            bail: false,
+            xtrace: false,
+            json: false,
+            results: None,
+            results_failed: None,
+            override_cmds: vec![],
+            strace: vec![],
+            docker: None,
+            timeout: Some(std::time::Duration::from_millis(200)),
+        };
+
+        let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = tf
+            .tests
+            .iter()
+            .map(|t| (t.name.as_str(), tf.functions.as_slice(), path.as_path()))
+            .collect();
+
+        let results = run_all_tests(test_refs, &config).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].passed);
+        assert!(results[0].timed_out);
     }
 }
 

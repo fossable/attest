@@ -14,8 +14,8 @@ pub struct StatusDisplay {
 }
 
 impl StatusDisplay {
-    pub fn new(total: usize) -> Self {
-        if !indicatif::ProgressDrawTarget::stderr().is_hidden() {
+    pub fn new(total: usize, json: bool) -> Self {
+        if !json && !indicatif::ProgressDrawTarget::stderr().is_hidden() {
             let bar = ProgressBar::new(total as u64);
             bar.set_style(
                 ProgressStyle::default_bar()
@@ -59,9 +59,105 @@ impl StatusDisplay {
     }
 }
 
+/// Escape a string for inclusion as a JSON string value (without surrounding quotes).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+pub fn print_test_result_json(result: &TestResult) {
+    let status = if result.passed {
+        "pass"
+    } else if result.timed_out {
+        "timeout"
+    } else {
+        "fail"
+    };
+
+    let read_log = |name: &str| -> String {
+        std::fs::read_to_string(result.tmp_dir.join(name)).unwrap_or_default()
+    };
+
+    let stdout = json_escape(&read_log("stdout.log"));
+    let xtrace = json_escape(&read_log("xtrace.log"));
+
+    // Collect strace logs: strace/<cmd>.log → key is <cmd>
+    let strace_dir = result.tmp_dir.join("strace");
+    let mut strace_pairs: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&strace_dir) {
+        let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let fname = entry.file_name();
+            let fname = fname.to_string_lossy();
+            let key = fname.strip_suffix(".log").unwrap_or(&fname);
+            let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            strace_pairs.push(format!(
+                "\"{}\":\"{}\"",
+                json_escape(key),
+                json_escape(&content)
+            ));
+        }
+    }
+    let strace_obj = format!("{{{}}}", strace_pairs.join(","));
+
+    #[cfg(feature = "cgroup")]
+    let resources_json = match result.resources {
+        Some(ref r) => {
+            let mut fields: Vec<String> = Vec::new();
+            if let Some(v) = r.cpu_user_usec {
+                fields.push(format!("\"cpu_user_usec\":{v}"));
+            }
+            if let Some(v) = r.cpu_system_usec {
+                fields.push(format!("\"cpu_system_usec\":{v}"));
+            }
+            if let Some(v) = r.memory_peak {
+                fields.push(format!("\"memory_peak\":{v}"));
+            }
+            if let Some(v) = r.io_read_bytes {
+                fields.push(format!("\"io_read_bytes\":{v}"));
+            }
+            if let Some(v) = r.io_write_bytes {
+                fields.push(format!("\"io_write_bytes\":{v}"));
+            }
+            if let Some(v) = r.pids_peak {
+                fields.push(format!("\"pids_peak\":{v}"));
+            }
+            format!("{{{}}}", fields.join(","))
+        }
+        None => "null".to_string(),
+    };
+    #[cfg(not(feature = "cgroup"))]
+    let resources_json = "null";
+
+    let name = json_escape(&result.name);
+    let file = json_escape(&result.source_path.display().to_string());
+    let duration_ms = result.duration.as_millis();
+
+    println!(
+        r#"{{"name":"{name}","file":"{file}","status":"{status}","duration_ms":{duration_ms},"stdout":"{stdout}","xtrace":"{xtrace}","strace":{strace_obj},"resources":{resources_json}}}"#
+    );
+}
+
 pub fn print_test_result(result: &TestResult) {
     let (label, color) = if result.passed {
         ("PASS", GREEN)
+    } else if result.timed_out {
+        ("TIME", RED)
     } else {
         ("FAIL", RED)
     };

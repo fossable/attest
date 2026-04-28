@@ -217,7 +217,7 @@ fn read_stat_field(path: impl AsRef<std::path::Path>, field: &str) -> Option<u64
 
 /// Sum a named field (e.g. `rbytes`) across all device lines in `io.stat`.
 /// Returns `None` when the file is absent or the total is zero.
-fn read_io_field(cgroup_path: &PathBuf, field: &str) -> Option<u64> {
+fn read_io_field(cgroup_path: &Path, field: &str) -> Option<u64> {
     let content = std::fs::read_to_string(cgroup_path.join("io.stat")).ok()?;
     let prefix = format!("{field}=");
     let total: u64 = content

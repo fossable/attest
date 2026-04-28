@@ -5,7 +5,7 @@
 
 **attest** is a simple and modern test framework for CLI programs. There is no
 exotic test syntax to remember, assertion API, or hidden lifecycle methods to
-know about. Tests are just regular shell functions where every command is an
+know about. Tests are just regular shell functions where every statement is an
 assertion.
 
 We already have all of the tools we need to write tests in the shell:
@@ -16,10 +16,7 @@ We already have all of the tools we need to write tests in the shell:
 - Need some test setup/cleanup? Easy with helper functions and traps.
 
 By keeping the framework lightweight, tests are easy to write and quick to
-understand, leading to more effective tests.
-
-By writing the tests in a shell scripting language, we operate at a high level
-of abstraction.
+understand, leading to an overall more effective testing experience.
 
 ## Writing tests
 

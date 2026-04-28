@@ -4,7 +4,7 @@ description = "Dead simple test framework for the age of AI"
 edition = "2024"
 license = "Unlicense"
 name = "attest"
-version = "0.2.0"
+version = "0.3.0"
 
 [features]
 default = ["cgroup"]
@@ -20,6 +20,6 @@ tempfile = "3"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 which = "8.0.2"
-indicatif = "0.17"
+indicatif = "0.18.4"
 annotate-snippets = "0.12"
 similar = "3"
