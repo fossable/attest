@@ -31,6 +31,10 @@ testHello() {
 }
 ```
 
+It looks like an ordinary shell script because it **is** an ordinary shell
+script. You could even source it into your shell and run it directly if you
+wanted to.
+
 There are only three implicit pieces of knowledge that you need for writing
 tests:
 

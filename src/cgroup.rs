@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tracing::{debug, warn};
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Resolved once per process: the `/sys/fs/cgroup/.../attest` directory that
 /// belongs to this user. `None` if cgroups are unavailable or unwritable.
@@ -30,7 +32,7 @@ impl TestCgroup {
     /// Attempt to create a per-test cgroup directory. Returns `None` when
     /// cgroups are unavailable or the process lacks permission.
     pub fn try_create(test_id: &str) -> Option<Self> {
-        let base = ATTEST_BASE.get_or_init(init_attest_base).as_ref()?;
+        let base = ATTEST_BASE.get_or_init(init_base).as_ref()?;
 
         let safe_id: String = test_id
             .chars()
@@ -51,11 +53,11 @@ impl TestCgroup {
                 // Leftover from a previous run – try to reuse after cleanup
                 let _ = std::fs::remove_dir(&path);
                 if let Err(e2) = std::fs::create_dir(&path) {
-                    tracing::debug!("failed to create test cgroup {dir_name}: {e2}");
+                    debug!("Failed to create test cgroup {dir_name}: {e2}");
                     return None;
                 }
             } else {
-                tracing::debug!("failed to create test cgroup {dir_name}: {e}");
+                debug!("Failed to create test cgroup {dir_name}: {e}");
                 return None;
             }
         }
@@ -68,7 +70,7 @@ impl TestCgroup {
     pub fn enter(&self) {
         let pid = std::process::id().to_string();
         if let Err(e) = std::fs::write(self.path.join("cgroup.procs"), &pid) {
-            tracing::debug!("failed to enter test cgroup: {e}");
+            debug!("Failed to enter test cgroup: {e}");
         }
     }
 
@@ -87,7 +89,7 @@ impl TestCgroup {
             cpu_user_usec: read_stat_field(self.path.join("cpu.stat"), "user_usec"),
             cpu_system_usec: read_stat_field(self.path.join("cpu.stat"), "system_usec"),
             memory_peak: read_single_u64(self.path.join("memory.peak")).or_else(|| {
-                tracing::debug!("memory.peak unavailable, falling back to memory.current");
+                debug!("memory.peak unavailable, falling back to memory.current");
                 read_single_u64(self.path.join("memory.current"))
             }),
             io_read_bytes: read_io_field(&self.path, "rbytes"),
@@ -100,19 +102,14 @@ impl TestCgroup {
 impl Drop for TestCgroup {
     fn drop(&mut self) {
         if let Err(e) = std::fs::remove_dir(&self.path) {
-            tracing::warn!("failed to remove test cgroup {:?}: {e}", self.path);
+            warn!("failed to remove test cgroup {:?}: {e}", self.path);
         }
     }
 }
 
-/// Find the nearest ancestor cgroup where `cgroup.procs` works, create the
-/// `attest` directory there, and enable resource controllers.
-///
-/// Rather than guessing from `cgroup.type` (whose semantics around
-/// "domain threaded" vary across kernel versions), we fork a throw-away probe
-/// child that actually attempts the write. EOPNOTSUPP at one level means we
-/// walk up and try the parent.
-fn init_attest_base() -> Option<PathBuf> {
+/// Find the nearest ancestor cgroup where `cgroup.procs` works. Create a new
+/// cgroup there and enable resource controllers.
+fn init_base() -> Option<PathBuf> {
     let cg_content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let rel = cg_content
         .lines()
@@ -131,7 +128,7 @@ fn init_attest_base() -> Option<PathBuf> {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => {
-                tracing::debug!("cannot create {}: {e}", base.display());
+                debug!("cannot create {}: {e}", base.display());
                 match ancestor.parent() {
                     Some(p) if p != Path::new("/sys/fs/cgroup") => {
                         ancestor = p.to_path_buf();
@@ -160,11 +157,11 @@ fn init_attest_base() -> Option<PathBuf> {
                 let _ = std::fs::write(ancestor.join("cgroup.subtree_control"), format!("+{ctrl}"));
                 let _ = std::fs::write(base.join("cgroup.subtree_control"), format!("+{ctrl}"));
             }
-            tracing::debug!("cgroup base: {}", base.display());
+            debug!("cgroup base: {}", base.display());
             return Some(base);
         }
 
-        tracing::debug!(
+        debug!(
             "cgroup.procs probe failed at {}; trying parent",
             base.display()
         );
@@ -175,7 +172,7 @@ fn init_attest_base() -> Option<PathBuf> {
         }
     }
 
-    tracing::debug!("cgroup setup failed: no suitable cgroup found in hierarchy");
+    debug!("No suitable cgroup found in hierarchy");
     None
 }
 

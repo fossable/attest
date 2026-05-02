@@ -19,11 +19,11 @@ struct BracketExpr {
 
 /// Print a source snippet showing where a failed test went wrong.
 pub fn print_failure_snippet(result: &TestResult) {
-    let Some(failure) = parse_xtrace_failure(&result.tmp_dir) else {
+    let Some(failure) = parse_xtrace_failure(&result.context) else {
         return;
     };
 
-    let functions_sh = result.tmp_dir.join("functions.sh");
+    let functions_sh = result.context.join("functions.sh");
     let Ok(functions_source) = std::fs::read_to_string(&functions_sh) else {
         return;
     };

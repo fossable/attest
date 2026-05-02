@@ -1,8 +1,12 @@
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-
+use anyhow::{Result, anyhow};
 use brush_parser::ast::FunctionDefinition;
+use std::io::Write;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use crate::output;
 
@@ -31,7 +35,7 @@ impl XtraceStreamer {
         if self.holder.is_some() {
             return;
         }
-        let xtrace_path = pending.tmp_dir.as_ref().unwrap().join("xtrace.log");
+        let xtrace_path = pending.context.as_ref().unwrap().join("xtrace.log");
         if let Ok(f) = std::fs::File::open(&xtrace_path) {
             eprintln!("\x1b[2m--- xtrace: {} ---\x1b[0m", pending.name);
             self.holder = Some(pending.name.clone());
@@ -57,7 +61,6 @@ impl XtraceStreamer {
         let mut buf = Vec::new();
         if f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
             self.offset += buf.len() as u64;
-            use std::io::Write;
             let _ = write!(std::io::stderr(), "\x1b[2m");
             let _ = std::io::stderr().write_all(&buf);
             let _ = write!(std::io::stderr(), "\x1b[0m");
@@ -83,11 +86,10 @@ impl XtraceStreamer {
         if self.is_holder(&pending.name) {
             return; // Will be flushed via release()
         }
-        let xtrace_path = pending.tmp_dir.as_ref().unwrap().join("xtrace.log");
+        let xtrace_path = pending.context.as_ref().unwrap().join("xtrace.log");
         if let Ok(content) = std::fs::read(&xtrace_path)
             && !content.is_empty()
         {
-            use std::io::Write;
             eprintln!("\x1b[2m--- xtrace: {} ---\x1b[0m", pending.name);
             let _ = write!(std::io::stderr(), "\x1b[2m");
             let _ = std::io::stderr().write_all(&content);
@@ -101,7 +103,7 @@ pub struct TestResult {
     pub passed: bool,
     pub timed_out: bool,
     pub duration: Duration,
-    pub tmp_dir: PathBuf,
+    pub context: PathBuf,
     pub source_path: PathBuf,
     #[cfg(feature = "cgroup")]
     pub resources: Option<crate::cgroup::ResourceStats>,
@@ -118,7 +120,7 @@ struct PendingTest {
     name: String,
     start: Instant,
     /// `None` after the path has been transferred to `TestResult`.
-    tmp_dir: Option<PathBuf>,
+    context: Option<PathBuf>,
     source_path: PathBuf,
     #[cfg(feature = "cgroup")]
     cgroup: Option<crate::cgroup::TestCgroup>,
@@ -133,7 +135,7 @@ impl Drop for PendingTest {
                 libc::waitpid(self.pid, &mut s, 0);
             }
         }
-        if let Some(ref dir) = self.tmp_dir {
+        if let Some(ref dir) = self.context {
             let _ = std::fs::remove_dir_all(dir);
         }
         // cgroup field drops here, removing the cgroup directory
@@ -145,8 +147,9 @@ pub struct RunConfig {
     pub bail: bool,
     pub xtrace: bool,
     pub json: bool,
-    pub results: Option<PathBuf>,
-    pub results_failed: Option<PathBuf>,
+    /// When set, each test's context directory is created here and left on exit.
+    /// When unset, context dirs are temporary and cleaned up automatically.
+    pub save_context: Option<PathBuf>,
     pub override_cmds: Vec<String>,
     pub strace: Vec<String>,
     pub docker: Option<String>,
@@ -157,7 +160,7 @@ pub struct RunConfig {
 pub fn run_all_tests(
     tests: Vec<(&str, &[FunctionDefinition], &Path)>,
     config: &RunConfig,
-) -> anyhow::Result<Vec<TestResult>> {
+) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
     let total = tests.len();
     let status = output::StatusDisplay::new(total, config.json);
@@ -173,6 +176,15 @@ pub fn run_all_tests(
         None
     };
 
+    let tmp = tempfile::TempDir::new()?;
+
+    let contexts_dir = if let Some(ref save_dir) = config.save_context {
+        std::fs::create_dir_all(save_dir)?;
+        save_dir
+    } else {
+        tmp.path()
+    };
+
     // Seed the initial batch up to max_parallel.
     while pending_list.len() < max_parallel {
         if let Some((test_name, all_functions, source_path)) = test_iter.next() {
@@ -180,6 +192,7 @@ pub fn run_all_tests(
                 test_name,
                 all_functions,
                 source_path,
+                contexts_dir.join(test_name),
                 &config.override_cmds,
                 &config.strace,
                 config.docker.as_deref(),
@@ -223,7 +236,7 @@ pub fn run_all_tests(
             if ret > 0 {
                 reaped.push((i, status_code));
             } else if ret == -1 {
-                return Err(anyhow::anyhow!(
+                return Err(anyhow!(
                     "waitpid failed: {}",
                     std::io::Error::last_os_error()
                 ));
@@ -274,6 +287,7 @@ pub fn run_all_tests(
                     test_name,
                     all_functions,
                     source_path,
+                    contexts_dir.join(test_name),
                     &config.override_cmds,
                     &config.strace,
                     config.docker.as_deref(),
@@ -294,7 +308,7 @@ pub fn run_all_tests(
         }
 
         // Update status line with currently running tests.
-        let running: Vec<(&str, std::time::Duration)> = pending_list
+        let running: Vec<(&str, Duration)> = pending_list
             .iter()
             .map(|p| {
                 #[cfg(feature = "cgroup")]
@@ -310,21 +324,15 @@ pub fn run_all_tests(
             .collect();
         status.update(&running, results.len());
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     status.finish();
 
-    if let Some(ref dir) = config.results {
-        copy_results_dirs(&results, dir, false)?;
-    }
-    if let Some(ref dir) = config.results_failed {
-        copy_results_dirs(&results, dir, true)?;
-    }
-
     if !config.json {
         output::print_summary(&results, wall_start.elapsed());
     }
+
     Ok(results)
 }
 
@@ -334,15 +342,19 @@ fn fork_test(
     test_name: &str,
     all_functions: &[FunctionDefinition],
     source_path: &Path,
+    context: PathBuf,
     override_cmds: &[String],
     strace: &[String],
     docker: Option<&str>,
-) -> anyhow::Result<PendingTest> {
-    let tmp_dir = tempfile::TempDir::new()?;
-    let tmp_path = tmp_dir.keep();
+) -> Result<PendingTest> {
+    if std::fs::exists(&context)? {
+        std::fs::remove_dir_all(&context)?;
+    }
+
+    std::fs::create_dir_all(&context)?;
 
     // Write all functions to a temporary script before forking.
-    let script_path = tmp_path.join("functions.sh");
+    let script_path = context.join("functions.sh");
     let mut script = String::new();
     for func in all_functions {
         script.push_str(&func.to_string());
@@ -350,14 +362,21 @@ fn fork_test(
     }
     std::fs::write(&script_path, &script)?;
 
-    // Always create bin/ dir; populate it with override binaries if requested.
-    std::fs::create_dir_all(tmp_path.join("bin"))?;
+    // Populate bin/ with override binaries if requested
     if !override_cmds.is_empty() {
-        create_override_bins(&tmp_path, override_cmds)?;
+        let dest: &Path = &context.join("bin");
+        std::fs::create_dir_all(dest)?;
+
+        for cmd in override_cmds {
+            let src =
+                which::which(cmd).map_err(|_| anyhow!("--override: command not found: {cmd}"))?;
+            let dst = dest.join(cmd);
+            std::fs::copy(&src, &dst)?;
+        }
     }
 
     if !strace.is_empty() {
-        create_strace_wrappers(&tmp_path, strace)?;
+        create_strace_wrappers(&context, strace)?;
     }
 
     // Clone data the child will need (fork copies memory, but owned values
@@ -368,29 +387,22 @@ fn fork_test(
         .unwrap_or_else(|_| source_path.to_path_buf());
     let strace_owned = strace.to_vec();
     let docker_owned = docker.map(|s| s.to_string());
-    let tmp_path_child = tmp_path.clone();
+    let tmp_path_child = context.clone();
 
     #[cfg(feature = "cgroup")]
     let cgroup = crate::cgroup::TestCgroup::try_create(test_name);
 
     let start = Instant::now();
 
-    let pid = unsafe { libc::fork() };
-    match pid {
-        -1 => Err(anyhow::anyhow!(
-            "fork failed: {}",
-            std::io::Error::last_os_error()
-        )),
+    match unsafe { libc::fork() } {
+        -1 => Err(anyhow!("fork failed: {}", std::io::Error::last_os_error())),
         0 => {
             // ── Child process ──────────────────────────────────────────────
-            // Enter the cgroup before doing anything else so all child
-            // processes are attributed to this test.
+            // TODO don't include test setup in cgroup
             #[cfg(feature = "cgroup")]
             if let Some(ref cg) = cgroup {
                 cg.enter();
             }
-
-            use std::os::unix::process::CommandExt;
 
             if let Some(ref image) = docker_owned {
                 // Docker mode: write a runner script with container-internal paths,
@@ -409,7 +421,8 @@ fn fork_test(
                     unsafe { libc::_exit(1) };
                 }
                 let mount = format!("{}:/attest", tmp_path_child.display());
-                let err = std::process::Command::new("docker")
+                // TODO add to cgroup via --cgroup-parent and --cgroupns
+                let err = Command::new("docker")
                     .args([
                         "run",
                         "--rm",
@@ -435,7 +448,7 @@ fn fork_test(
             // image entirely. Passing source_path as argv[0] makes $0 inside
             // the test functions refer to the original script, not the runner.
             let source_str = source_path_owned.to_str().unwrap_or("sh").to_string();
-            let err = std::process::Command::new("/bin/sh")
+            let err = Command::new("/bin/sh")
                 .args(["-c", &runner_content, &source_str])
                 .exec();
             eprintln!("exec /bin/sh failed: {err}");
@@ -449,7 +462,7 @@ fn fork_test(
                 timed_out: false,
                 name: test_name.to_string(),
                 start,
-                tmp_dir: Some(tmp_path),
+                context: Some(context),
                 source_path: source_path_owned,
                 #[cfg(feature = "cgroup")]
                 cgroup,
@@ -469,14 +482,12 @@ fn build_result(mut pending: PendingTest, status: libc::c_int) -> TestResult {
     #[cfg(feature = "cgroup")]
     let resources = pending.cgroup.as_ref().map(|cg| cg.read_stats());
 
-    let tmp_dir = pending.tmp_dir.take().unwrap();
-
     TestResult {
         name: pending.name.clone(),
         passed,
         timed_out,
         duration,
-        tmp_dir,
+        context: pending.context.take().unwrap(),
         source_path: pending.source_path.clone(),
         #[cfg(feature = "cgroup")]
         resources,
@@ -526,9 +537,7 @@ fn build_runner_script(
     s
 }
 
-fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
+fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> Result<()> {
     let strace_bin = working_dir.join("strace_bin");
     std::fs::create_dir_all(&strace_bin)?;
 
@@ -537,7 +546,7 @@ fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> anyhow::Re
 
     for cmd in commands {
         let real_path =
-            which::which(cmd).map_err(|_| anyhow::anyhow!("--strace: command not found: {cmd}"))?;
+            which::which(cmd).map_err(|_| anyhow!("--strace: command not found: {cmd}"))?;
 
         let wrapper = strace_bin.join(cmd);
         let strace_out = strace_dir.join(format!("{cmd}.log"));
@@ -550,59 +559,6 @@ fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> anyhow::Re
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
     }
 
-    Ok(())
-}
-
-fn create_override_bins(working_dir: &Path, commands: &[String]) -> anyhow::Result<()> {
-    let bin_dir = working_dir.join("bin");
-    std::fs::create_dir_all(&bin_dir)?;
-
-    for cmd in commands {
-        let src = which::which(cmd)
-            .map_err(|_| anyhow::anyhow!("--override: command not found: {cmd}"))?;
-        let dst = bin_dir.join(cmd);
-        std::fs::copy(&src, &dst)?;
-    }
-
-    Ok(())
-}
-
-fn copy_results_dirs(
-    results: &[TestResult],
-    dest_dir: &Path,
-    failed_only: bool,
-) -> anyhow::Result<()> {
-    let iter = results.iter().filter(|r| !failed_only || !r.passed);
-
-    if failed_only && !results.iter().any(|r| !r.passed) {
-        return Ok(());
-    }
-
-    if dest_dir.exists() {
-        std::fs::remove_dir_all(dest_dir)?;
-    }
-    std::fs::create_dir_all(dest_dir)?;
-
-    for result in iter {
-        let dest = dest_dir.join(&result.name);
-        copy_dir_recursive(&result.tmp_dir, &dest)?;
-    }
-
-    Ok(())
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path)?;
-        }
-    }
     Ok(())
 }
 
@@ -627,7 +583,8 @@ mod tests {
         let path = tmp.path().join("t.sh");
         fs::write(&path, script).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
-        let pending = fork_test(test_name, &tf.functions, &path, &[], &[], None).unwrap();
+        let ctx = TempDir::new().unwrap().keep();
+        let pending = fork_test(test_name, &tf.functions, &path, ctx, &[], &[], None).unwrap();
         wait_and_collect(pending)
     }
 
@@ -652,7 +609,7 @@ mod tests {
     #[test]
     fn execute_test_stdout_captured() {
         let r = run_inline("test_echo() {\n  echo captured_output\n}\n", "test_echo");
-        let stdout = fs::read_to_string(r.tmp_dir.join("stdout.log")).unwrap();
+        let stdout = fs::read_to_string(r.context.join("stdout.log")).unwrap();
         assert!(stdout.contains("captured_output"));
     }
 
@@ -664,10 +621,12 @@ mod tests {
         let path = tmp.path().join("t.sh");
         fs::write(&path, script_content).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
+        let ctx = TempDir::new().unwrap().keep();
         let pending = fork_test(
             "test_override",
             &tf.functions,
             &path,
+            ctx,
             &["true".to_string()],
             &[],
             None,
@@ -676,58 +635,7 @@ mod tests {
         let result = wait_and_collect(pending);
         assert!(result.passed);
         // bin/true should exist in the context dir
-        assert!(result.tmp_dir.join("bin/true").exists());
-    }
-
-    #[test]
-    fn copy_dir_recursive_works() {
-        let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("src_dir");
-        let dst = tmp.path().join("dst_dir");
-
-        fs::create_dir(&src).unwrap();
-        fs::write(src.join("file.txt"), "content").unwrap();
-        let sub = src.join("sub");
-        fs::create_dir(&sub).unwrap();
-        fs::write(sub.join("nested.txt"), "nested").unwrap();
-
-        copy_dir_recursive(&src, &dst).unwrap();
-
-        assert!(dst.join("file.txt").exists());
-        assert_eq!(fs::read_to_string(dst.join("file.txt")).unwrap(), "content");
-        assert!(dst.join("sub/nested.txt").exists());
-        assert_eq!(
-            fs::read_to_string(dst.join("sub/nested.txt")).unwrap(),
-            "nested"
-        );
-    }
-
-    #[test]
-    fn copy_failed_dirs_creates_output() {
-        let tmp = TempDir::new().unwrap();
-
-        // Create a fake test tmp dir with a log file
-        let test_tmp = tmp.path().join("test_tmp");
-        fs::create_dir(&test_tmp).unwrap();
-        fs::write(test_tmp.join("stdout.log"), "output").unwrap();
-
-        let results = vec![TestResult {
-            name: "test_failure".to_string(),
-            passed: false,
-            timed_out: false,
-            duration: Duration::from_millis(10),
-            tmp_dir: test_tmp.clone(),
-            source_path: PathBuf::from("test.sh"),
-            #[cfg(feature = "cgroup")]
-            resources: None,
-        }];
-
-        let failed_dir = tmp.path().join("failed");
-        copy_results_dirs(&results, &failed_dir, true).unwrap();
-        assert!(failed_dir.join("test_failure/stdout.log").exists());
-
-        // Prevent Drop from cleaning up test_tmp since we reference it in results
-        std::mem::forget(results);
+        assert!(result.context.join("bin/true").exists());
     }
 
     #[test]
@@ -778,8 +686,7 @@ mod tests {
             bail: false,
             xtrace: false,
             json: false,
-            results: None,
-            results_failed: None,
+            save_context: None,
             override_cmds: vec![],
             strace: vec![],
             docker: None,
@@ -818,8 +725,7 @@ mod tests {
             bail: true,
             xtrace: false,
             json: false,
-            results: None,
-            results_failed: None,
+            save_context: None,
             override_cmds: vec![],
             strace: vec![],
             docker: None,
@@ -858,8 +764,7 @@ mod tests {
             bail: false,
             xtrace: false,
             json: false,
-            results: None,
-            results_failed: None,
+            save_context: None,
             override_cmds: vec![],
             strace: vec![],
             docker: None,
@@ -898,8 +803,7 @@ mod tests {
             bail: false,
             xtrace: false,
             json: false,
-            results: None,
-            results_failed: None,
+            save_context: None,
             override_cmds: vec![],
             strace: vec![],
             docker: None,
@@ -916,12 +820,5 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(!results[0].passed);
         assert!(results[0].timed_out);
-    }
-}
-
-impl Drop for TestResult {
-    fn drop(&mut self) {
-        // Clean up tmp dir
-        let _ = std::fs::remove_dir_all(&self.tmp_dir);
     }
 }

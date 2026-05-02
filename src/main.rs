@@ -6,13 +6,16 @@ mod output;
 mod parser;
 mod runner;
 
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use std::path::{Path, PathBuf};
 
-use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::engine::ArgValueCompleter;
-
 #[derive(Parser)]
-#[command(version, name = "attest", about = "Shell-based test framework")]
+#[command(
+    version,
+    name = "attest",
+    about = "Dead simple test framework for the age of AI"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -30,13 +33,9 @@ struct Cli {
     #[arg(long, add = ArgValueCompleter::new(complete_tests))]
     filter: Option<String>,
 
-    /// Copy all test context directories to this directory on exit
+    /// Save test context directories instead of cleaning them up on exit
     #[arg(long)]
-    results: Option<PathBuf>,
-
-    /// Copy failed test context directories to this directory on exit
-    #[arg(long)]
-    results_failed: Option<PathBuf>,
+    save_context: Option<PathBuf>,
 
     /// Stop after first test failure
     #[arg(long)]
@@ -110,9 +109,7 @@ fn split_path_arg(arg: &str) -> (PathBuf, Option<String>) {
     (PathBuf::from(arg), None)
 }
 
-fn complete_tests(current: &std::ffi::OsStr) -> Vec<clap_complete::engine::CompletionCandidate> {
-    use clap_complete::engine::CompletionCandidate;
-
+fn complete_tests(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     let current = current.to_string_lossy();
     let mut candidates = Vec::new();
 
@@ -226,8 +223,7 @@ fn main() -> anyhow::Result<()> {
                 bail: cli.bail,
                 xtrace: cli.xtrace,
                 json: cli.json,
-                results: cli.results,
-                results_failed: cli.results_failed,
+                save_context: cli.save_context,
                 override_cmds: cli.r#override,
                 strace: cli.strace,
                 docker: cli.docker,

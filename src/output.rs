@@ -89,14 +89,14 @@ pub fn print_test_result_json(result: &TestResult) {
     };
 
     let read_log = |name: &str| -> String {
-        std::fs::read_to_string(result.tmp_dir.join(name)).unwrap_or_default()
+        std::fs::read_to_string(result.context.join(name)).unwrap_or_default()
     };
 
     let stdout = json_escape(&read_log("stdout.log"));
     let xtrace = json_escape(&read_log("xtrace.log"));
 
     // Collect strace logs: strace/<cmd>.log → key is <cmd>
-    let strace_dir = result.tmp_dir.join("strace");
+    let strace_dir = result.context.join("strace");
     let mut strace_pairs: Vec<String> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&strace_dir) {
         let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
