@@ -1,4 +1,4 @@
-Output parallel.gif
+Output .github/assets/parallel.gif
 
 Set Width 1000
 Set Height 600

@@ -148,7 +148,7 @@ which is pre-tuned to produce good tests. Here's an example prompt:
 <summary>Here's the output from Haiku 4.5:</summary>
 
 ```sh
-#!/usr/bin/env attest
+#!/usr/bin/env bash
 
 ## Basic functionality - reverse lines from a file
 testBasicFile() {
@@ -271,3 +271,25 @@ When a test fails, you can obtain the context directory:
 ```sh
 attest . --save-context ./results
 ```
+
+This directory contains everything: the test's xtrace, stdout, any files created
+by the tests, etc.
+
+You can also just view the xtrace output with the `--xtrace` flag:
+
+![](./.github/assets/xtrace.gif)
+
+## Installation
+
+<details>
+<summary>Crates.io</summary>
+
+![Crates.io Total Downloads](https://img.shields.io/crates/d/attest)
+
+#### Install from crates.io
+
+```sh
+cargo install attest
+```
+
+</details>
