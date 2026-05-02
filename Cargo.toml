@@ -4,10 +4,12 @@ description = "Dead simple test framework for the age of AI"
 edition = "2024"
 license = "Unlicense"
 name = "attest"
-version = "0.3.0"
+version = "0.4.0"
 
 [features]
 default = ["cgroup"]
+
+# Track test resource usage with cgroups
 cgroup = []
 
 [dependencies]

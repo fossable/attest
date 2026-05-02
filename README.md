@@ -253,5 +253,5 @@ temporary files created by the test.
 When a test fails, you can obtain the context directory:
 
 ```sh
-attest . --results-failed output
+attest . --save-context ./results
 ```

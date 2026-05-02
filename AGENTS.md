@@ -50,5 +50,8 @@ implicit assertion - if it exits nonzero, the test fails. Non-test functions
 - `--docker IMAGE` — run each test inside a Docker container with the test
   context dir mounted at `/attest`
 - `--xtrace` — stream xtrace output live (one test at a time)
-- `--results DIR` / `--results-failed DIR` — copy test context dirs to DIR on
-  exit
+- `--save-context DIR` — save test context to DIR for debugging
+
+## Building and running
+
+Use `cargo run --` to execute the project.
