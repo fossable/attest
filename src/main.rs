@@ -165,7 +165,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let env_filter = if cli.debug {
-        tracing_subscriber::EnvFilter::new("debug")
+        tracing_subscriber::EnvFilter::new("attest=debug")
     } else {
         tracing_subscriber::EnvFilter::from_default_env()
     };

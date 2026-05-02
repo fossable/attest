@@ -65,6 +65,30 @@ fn has_shell_shebang(path: &Path) -> std::io::Result<bool> {
     Ok(first_line.starts_with("#!") && is_shell_interpreter(first_line))
 }
 
+/// Returns the shell interpreter to use for a script file. Reads the shebang
+/// line and extracts the interpreter; falls back to "bash" if absent or unrecognized.
+pub(crate) fn get_script_shell(path: &Path) -> String {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return "bash".to_string();
+    };
+    let mut buf = [0u8; 256];
+    let Ok(n) = file.read(&mut buf) else {
+        return "bash".to_string();
+    };
+    let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    let first_line = head.lines().next().unwrap_or("");
+    if !first_line.starts_with("#!") || !is_shell_interpreter(first_line) {
+        return "bash".to_string();
+    }
+    let shebang = first_line.trim_start_matches("#!");
+    let parts: Vec<&str> = shebang.split_whitespace().collect();
+    if parts.first().is_some_and(|p| p.ends_with("/env")) {
+        parts.get(1).copied().unwrap_or("bash").to_string()
+    } else {
+        parts.first().copied().unwrap_or("bash").to_string()
+    }
+}
+
 pub(crate) fn is_shell_interpreter(shebang: &str) -> bool {
     let shebang = shebang.trim_start_matches("#!");
     // Handle "#!/usr/bin/env bash" style
@@ -75,10 +99,7 @@ pub(crate) fn is_shell_interpreter(shebang: &str) -> bool {
         parts.first().copied().unwrap_or("")
     };
     let basename = interpreter.rsplit('/').next().unwrap_or(interpreter);
-    matches!(
-        basename,
-        "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh" | "attest"
-    )
+    matches!(basename, "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh")
 }
 
 #[cfg(test)]
@@ -176,6 +197,31 @@ mod tests {
         let python_file = tmp.path().join("not_shell");
         fs::write(&python_file, "#!/usr/bin/python3\nprint('hi')\n").unwrap();
         assert!(!is_shell_script(&python_file));
+    }
+
+    #[test]
+    fn script_shell_from_shebang() {
+        let tmp = TempDir::new().unwrap();
+
+        let bash_file = tmp.path().join("bash.sh");
+        fs::write(&bash_file, "#!/bin/bash\necho hi\n").unwrap();
+        assert_eq!(get_script_shell(&bash_file), "/bin/bash");
+
+        let env_bash = tmp.path().join("env_bash.sh");
+        fs::write(&env_bash, "#!/usr/bin/env bash\necho hi\n").unwrap();
+        assert_eq!(get_script_shell(&env_bash), "bash");
+
+        let sh_file = tmp.path().join("sh.sh");
+        fs::write(&sh_file, "#!/bin/sh\necho hi\n").unwrap();
+        assert_eq!(get_script_shell(&sh_file), "/bin/sh");
+
+        let no_shebang = tmp.path().join("noshebang.sh");
+        fs::write(&no_shebang, "echo hi\n").unwrap();
+        assert_eq!(get_script_shell(&no_shebang), "bash");
+
+        let python_file = tmp.path().join("python.py");
+        fs::write(&python_file, "#!/usr/bin/python3\nprint('hi')\n").unwrap();
+        assert_eq!(get_script_shell(&python_file), "bash");
     }
 
     #[test]

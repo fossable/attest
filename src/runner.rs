@@ -5,8 +5,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use tracing::debug;
 
 use crate::output;
 
@@ -124,6 +125,10 @@ struct PendingTest {
     source_path: PathBuf,
     #[cfg(feature = "cgroup")]
     cgroup: Option<crate::cgroup::TestCgroup>,
+    /// Path to the Docker cidfile written by `docker run --cidfile`. Set only
+    /// for Docker tests; used to find the container's cgroup and clean up.
+    #[cfg(feature = "cgroup")]
+    docker_cidfile: Option<PathBuf>,
 }
 
 impl Drop for PendingTest {
@@ -133,6 +138,19 @@ impl Drop for PendingTest {
                 libc::kill(self.pid, libc::SIGKILL);
                 let mut s = 0;
                 libc::waitpid(self.pid, &mut s, 0);
+            }
+        }
+        // Docker containers are not removed by SIGKILL on the CLI process; force-remove them.
+        if let Some(ref cidfile) = self.docker_cidfile {
+            if let Ok(cid) = std::fs::read_to_string(cidfile) {
+                let cid = cid.trim().to_string();
+                if !cid.is_empty() {
+                    let _ = std::process::Command::new("docker")
+                        .args(["rm", "-f", &cid])
+                        .stderr(Stdio::null())
+                        .stdout(Stdio::null())
+                        .status();
+                }
             }
         }
         if let Some(ref dir) = self.context {
@@ -161,6 +179,19 @@ pub fn run_all_tests(
     tests: Vec<(&str, &[FunctionDefinition], &Path)>,
     config: &RunConfig,
 ) -> Result<Vec<TestResult>> {
+    if let Some(ref image) = config.docker {
+        debug!(image = image, "Pulling docker image");
+        let pull = Command::new("docker")
+            .args(["pull", image])
+            .stderr(Stdio::null())
+            .stdout(Stdio::null())
+            .status()
+            .map_err(|e| anyhow!("failed to run docker pull: {e}"))?;
+        if !pull.success() {
+            return Err(anyhow!("docker pull {image} failed"));
+        }
+    }
+
     let mut results = Vec::new();
     let total = tests.len();
     let status = output::StatusDisplay::new(total, config.json);
@@ -364,13 +395,15 @@ fn fork_test(
 
     // Populate bin/ with override binaries if requested
     if !override_cmds.is_empty() {
-        let dest: &Path = &context.join("bin");
-        std::fs::create_dir_all(dest)?;
+        let bin: &Path = &context.join("bin");
+        std::fs::create_dir_all(bin)?;
 
         for cmd in override_cmds {
             let src =
                 which::which(cmd).map_err(|_| anyhow!("--override: command not found: {cmd}"))?;
-            let dst = dest.join(cmd);
+            let dst = bin.join(src.file_name().expect("'which' result must have filename"));
+
+            debug!(src=%src.display(), dst=%dst.display(), "Overriding command");
             std::fs::copy(&src, &dst)?;
         }
     }
@@ -385,12 +418,22 @@ fn fork_test(
     let source_path_owned = source_path
         .canonicalize()
         .unwrap_or_else(|_| source_path.to_path_buf());
+    let shell_owned = crate::discovery::get_script_shell(&source_path_owned);
     let strace_owned = strace.to_vec();
     let docker_owned = docker.map(|s| s.to_string());
     let tmp_path_child = context.clone();
 
+    // For Docker tests we skip creating our own cgroup and let Docker manage it.
     #[cfg(feature = "cgroup")]
-    let cgroup = crate::cgroup::TestCgroup::try_create(test_name);
+    let cgroup = if docker.is_none() {
+        crate::cgroup::TestCgroup::try_create(test_name)
+    } else {
+        None
+    };
+    #[cfg(feature = "cgroup")]
+    let cidfile_path: Option<PathBuf> = docker.map(|_| context.join("container.cid"));
+    #[cfg(feature = "cgroup")]
+    let cidfile_child = cidfile_path.clone();
 
     let start = Instant::now();
 
@@ -421,18 +464,18 @@ fn fork_test(
                     unsafe { libc::_exit(1) };
                 }
                 let mount = format!("{}:/attest", tmp_path_child.display());
-                // TODO add to cgroup via --cgroup-parent and --cgroupns
-                let err = Command::new("docker")
-                    .args([
-                        "run",
-                        "--rm",
-                        "-v",
-                        &mount,
-                        image,
-                        "/bin/sh",
-                        "/attest/runner.sh",
-                    ])
-                    .exec();
+                let mut cmd = Command::new("docker");
+                // No --rm: the container is removed by PendingTest::drop() after
+                // cgroup stats have been read from the container's cgroup directory.
+                cmd.args(["run", "-v", &mount]);
+                #[cfg(feature = "cgroup")]
+                if let Some(ref cidfile) = cidfile_child {
+                    cmd.arg("--cidfile").arg(cidfile);
+                }
+                #[cfg(not(feature = "cgroup"))]
+                cmd.arg("--rm");
+                cmd.args([image.as_str(), shell_owned.as_str(), "/attest/runner.sh"]);
+                let err = cmd.exec();
                 eprintln!("exec docker failed: {err}");
                 unsafe { libc::_exit(1) };
             }
@@ -444,14 +487,15 @@ fn fork_test(
                 &strace_owned,
             );
 
-            // Exec /bin/sh -c <script> <source_path>: replaces this child
+            // Exec <shell> -c <script> <source_path>: replaces this child
             // image entirely. Passing source_path as argv[0] makes $0 inside
             // the test functions refer to the original script, not the runner.
-            let source_str = source_path_owned.to_str().unwrap_or("sh").to_string();
-            let err = Command::new("/bin/sh")
+            // The shell is determined by the source file's shebang, defaulting to bash.
+            let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
+            let err = Command::new(&shell_owned)
                 .args(["-c", &runner_content, &source_str])
                 .exec();
-            eprintln!("exec /bin/sh failed: {err}");
+            eprintln!("exec {} failed: {err}", shell_owned);
             unsafe { libc::_exit(1) };
         }
         child_pid => {
@@ -466,6 +510,8 @@ fn fork_test(
                 source_path: source_path_owned,
                 #[cfg(feature = "cgroup")]
                 cgroup,
+                #[cfg(feature = "cgroup")]
+                docker_cidfile: cidfile_path,
             })
         }
     }
@@ -480,7 +526,21 @@ fn build_result(mut pending: PendingTest, status: libc::c_int) -> TestResult {
 
     // Read stats before dropping cgroup (which removes the directory).
     #[cfg(feature = "cgroup")]
-    let resources = pending.cgroup.as_ref().map(|cg| cg.read_stats());
+    let resources = if let Some(ref cidfile) = pending.docker_cidfile {
+        // Docker test: find the container's own cgroup and read stats from it.
+        // The container is removed by Drop after this function returns.
+        (|| -> Option<crate::cgroup::ResourceStats> {
+            let cid = std::fs::read_to_string(cidfile).ok()?;
+            let cid = cid.trim();
+            if cid.is_empty() {
+                return None;
+            }
+            let cgroup_path = crate::cgroup::TestCgroup::find_container_cgroup(cid)?;
+            Some(crate::cgroup::TestCgroup::read_stats_at(&cgroup_path))
+        })()
+    } else {
+        pending.cgroup.as_ref().map(|cg| cg.read_stats())
+    };
 
     TestResult {
         name: pending.name.clone(),
