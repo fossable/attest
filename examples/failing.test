@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+testHostname() {
+	hostname
+}
+
+testFailing() {
+	hostname 1
+}

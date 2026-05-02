@@ -1,4 +1,4 @@
-#!/usr/bin/attest
+#!/usr/bin/env bash
 ## Useful to simulate long-running tests
 
 testHelp() {

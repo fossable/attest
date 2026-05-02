@@ -1,19 +1,31 @@
+<p align="center">
+	<img src="https://raw.githubusercontent.com/fossable/fossable/master/emblems/attest.svg" style="width:90%; height:auto;"/>
+</p>
+
+![License](https://img.shields.io/github/license/fossable/attest)
+![GitHub repo size](https://img.shields.io/github/repo-size/fossable/attest)
+![Stars](https://img.shields.io/github/stars/fossable/attest?style=social)
+
+<hr>
+
+![](./.github/assets/parallel.gif)
+
 > perfection is finally attained not when there is no longer anything to add,
 > but when there is no longer anything to take away
 >
 > Terre des Hommes (1939) - Antoine de Saint Exupéry
 
 **attest** is a simple and modern test framework for CLI programs. There is no
-exotic test syntax to remember, assertion API, or hidden lifecycle methods to
-know about. Tests are just regular shell functions where every statement is an
-assertion.
+exotic test syntax to remember, assertion API, plugins, or hidden lifecycle
+methods to know about. Tests are just regular shell functions where every
+statement is an assertion.
 
 We already have all of the tools we need to write tests in the shell:
 
 - Shell functions neatly organize tests into runnable units
 - Need to compare text? `[` and `[[` have been around for decades
 - Need to compare JSON? `jq -c` has you covered.
-- Need some test setup/cleanup? Easy with helper functions and traps.
+- Need some test setup/cleanup? Idiomatic with helper functions and traps.
 
 By keeping the framework lightweight, tests are easy to write and quick to
 understand, leading to an overall more effective testing experience.
@@ -33,7 +45,7 @@ testHello() {
 
 It looks like an ordinary shell script because it **is** an ordinary shell
 script. You could even source it into your shell and run it directly if you
-wanted to.
+wanted to. Don't try that with Bats :).
 
 There are only three implicit pieces of knowledge that you need for writing
 tests:
@@ -232,6 +244,8 @@ human to quickly understand and assess the quality of AI-produced tests.
 
 ## Running tests
 
+![](./.github/assets/serial.gif)
+
 Now that we have some tests, AI-generated or not, it's time for the good part.
 
 ```sh
@@ -249,6 +263,8 @@ Every test runs in a temporary _context directory_ that collects logs and
 temporary files created by the test.
 
 ## Debugging tests
+
+![](./.github/assets/diagnostic.gif)
 
 When a test fails, you can obtain the context directory:
 

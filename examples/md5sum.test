@@ -1,4 +1,4 @@
-#!/usr/bin/attest
+#!/usr/bin/env bash
 
 testHelp() {
 	md5sum --help
