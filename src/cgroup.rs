@@ -65,13 +65,10 @@ impl TestCgroup {
         Some(Self { path })
     }
 
-    /// Place the current process into this cgroup. Call this from the forked
-    /// child immediately after fork, before running the test.
-    pub fn enter(&self) {
-        let pid = std::process::id().to_string();
-        if let Err(e) = std::fs::write(self.path.join("cgroup.procs"), &pid) {
-            debug!("Failed to enter test cgroup: {e}");
-        }
+    /// Path of the `cgroup.procs` file the child writes its pid into to join
+    /// this cgroup. Used from `Command::pre_exec` after fork, before exec.
+    pub fn procs_path(&self) -> PathBuf {
+        self.path.join("cgroup.procs")
     }
 
     /// Read total CPU time (user + system) from the cgroup. Returns `None`
@@ -114,9 +111,8 @@ impl TestCgroup {
         ResourceStats {
             cpu_user_usec: read_stat_field(path.join("cpu.stat"), "user_usec"),
             cpu_system_usec: read_stat_field(path.join("cpu.stat"), "system_usec"),
-            memory_peak: read_single_u64(path.join("memory.peak")).or_else(|| {
-                read_single_u64(path.join("memory.current"))
-            }),
+            memory_peak: read_single_u64(path.join("memory.peak"))
+                .or_else(|| read_single_u64(path.join("memory.current"))),
             io_read_bytes: read_io_field(path, "rbytes"),
             io_write_bytes: read_io_field(path, "wbytes"),
             pids_peak: read_single_u64(path.join("pids.peak")),

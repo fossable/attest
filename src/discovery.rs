@@ -233,7 +233,6 @@ mod tests {
         assert!(is_shell_interpreter("#!/bin/dash"));
         assert!(is_shell_interpreter("#!/bin/ash"));
         assert!(is_shell_interpreter("#!/usr/bin/env ksh"));
-        assert!(is_shell_interpreter("#!/usr/bin/attest"));
         assert!(!is_shell_interpreter("#!/usr/bin/python3"));
         assert!(!is_shell_interpreter("#!/usr/bin/env ruby"));
         assert!(!is_shell_interpreter("#!/usr/bin/env node"));

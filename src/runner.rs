@@ -5,7 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -110,12 +110,10 @@ pub struct TestResult {
     pub resources: Option<crate::cgroup::ResourceStats>,
 }
 
-/// State held by the parent for a forked test child that has not yet been
+/// State held by the parent for a spawned test child that has not yet been
 /// waited on. Dropping this kills the child (if still running) and cleans up.
 struct PendingTest {
-    pid: libc::pid_t,
-    /// Set to `true` once `waitpid` has reaped the child so `Drop` skips it.
-    reaped: bool,
+    child: Child,
     /// Set to `true` when the child was killed due to exceeding `--timeout`.
     timed_out: bool,
     name: String,
@@ -133,19 +131,16 @@ struct PendingTest {
 
 impl Drop for PendingTest {
     fn drop(&mut self) {
-        if !self.reaped {
-            unsafe {
-                libc::kill(self.pid, libc::SIGKILL);
-                let mut s = 0;
-                libc::waitpid(self.pid, &mut s, 0);
-            }
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
         // Docker containers are not removed by SIGKILL on the CLI process; force-remove them.
         if let Some(ref cidfile) = self.docker_cidfile {
             if let Ok(cid) = std::fs::read_to_string(cidfile) {
                 let cid = cid.trim().to_string();
                 if !cid.is_empty() {
-                    let _ = std::process::Command::new("docker")
+                    let _ = Command::new("docker")
                         .args(["rm", "-f", &cid])
                         .stderr(Stdio::null())
                         .stdout(Stdio::null())
@@ -219,7 +214,7 @@ pub fn run_all_tests(
     // Seed the initial batch up to max_parallel.
     while pending_list.len() < max_parallel {
         if let Some((test_name, all_functions, source_path)) = test_iter.next() {
-            pending_list.push(fork_test(
+            pending_list.push(spawn_test(
                 test_name,
                 all_functions,
                 source_path,
@@ -253,26 +248,20 @@ pub fn run_all_tests(
         if let Some(timeout) = config.timeout {
             for pending in pending_list.iter_mut() {
                 if !pending.timed_out && pending.start.elapsed() > timeout {
-                    unsafe { libc::kill(pending.pid, libc::SIGKILL) };
+                    let _ = pending.child.kill();
                     pending.timed_out = true;
                 }
             }
         }
 
-        // Non-blocking reap: check all pending tests with WNOHANG.
-        let mut reaped: Vec<(usize, libc::c_int)> = Vec::new();
-        for (i, pending) in pending_list.iter().enumerate() {
-            let mut status_code: libc::c_int = 0;
-            let ret = unsafe { libc::waitpid(pending.pid, &mut status_code, libc::WNOHANG) };
-            if ret > 0 {
-                reaped.push((i, status_code));
-            } else if ret == -1 {
-                return Err(anyhow!(
-                    "waitpid failed: {}",
-                    std::io::Error::last_os_error()
-                ));
+        // Non-blocking reap: check all pending children.
+        let mut reaped: Vec<(usize, ExitStatus)> = Vec::new();
+        for (i, pending) in pending_list.iter_mut().enumerate() {
+            match pending.child.try_wait() {
+                Ok(Some(status)) => reaped.push((i, status)),
+                Ok(None) => {} // still running
+                Err(e) => return Err(anyhow!("try_wait failed: {e}")),
             }
-            // ret == 0 means child still running
         }
 
         // Process reaped tests in reverse index order so removal doesn't shift indices.
@@ -290,11 +279,10 @@ pub fn run_all_tests(
                     }
                 });
             }
-            let mut pending = pending_list.remove(i);
+            let pending = pending_list.remove(i);
             if bail_flag {
                 continue; // Drop kills + cleans up
             }
-            pending.reaped = true;
             let result = build_result(pending, exit_status);
             completed.push(result);
         }
@@ -314,7 +302,7 @@ pub fn run_all_tests(
             results.push(result);
 
             if !bail_flag && let Some((test_name, all_functions, source_path)) = test_iter.next() {
-                pending_list.push(fork_test(
+                pending_list.push(spawn_test(
                     test_name,
                     all_functions,
                     source_path,
@@ -367,9 +355,9 @@ pub fn run_all_tests(
     Ok(results)
 }
 
-/// Fork a child process that will run the test. Returns a `PendingTest` that
-/// the caller must pass to `wait_and_collect` (or simply drop to kill+clean up).
-fn fork_test(
+/// Spawn a child process that will run the test. Returns a `PendingTest` that
+/// the caller must reap (or simply drop to kill+clean up).
+fn spawn_test(
     test_name: &str,
     all_functions: &[FunctionDefinition],
     source_path: &Path,
@@ -384,7 +372,6 @@ fn fork_test(
 
     std::fs::create_dir_all(&context)?;
 
-    // Write all functions to a temporary script before forking.
     let script_path = context.join("functions.sh");
     let mut script = String::new();
     for func in all_functions {
@@ -393,7 +380,6 @@ fn fork_test(
     }
     std::fs::write(&script_path, &script)?;
 
-    // Populate bin/ with override binaries if requested
     if !override_cmds.is_empty() {
         let bin: &Path = &context.join("bin");
         std::fs::create_dir_all(bin)?;
@@ -412,16 +398,10 @@ fn fork_test(
         create_strace_wrappers(&context, strace)?;
     }
 
-    // Clone data the child will need (fork copies memory, but owned values
-    // need to be independent so both sides can operate without aliasing).
-    let test_name_owned = test_name.to_string();
     let source_path_owned = source_path
         .canonicalize()
         .unwrap_or_else(|_| source_path.to_path_buf());
-    let shell_owned = crate::discovery::get_script_shell(&source_path_owned);
-    let strace_owned = strace.to_vec();
-    let docker_owned = docker.map(|s| s.to_string());
-    let tmp_path_child = context.clone();
+    let shell = crate::discovery::get_script_shell(&source_path_owned);
 
     // For Docker tests we skip creating our own cgroup and let Docker manage it.
     #[cfg(feature = "cgroup")]
@@ -432,97 +412,81 @@ fn fork_test(
     };
     #[cfg(feature = "cgroup")]
     let cidfile_path: Option<PathBuf> = docker.map(|_| context.join("container.cid"));
-    #[cfg(feature = "cgroup")]
-    let cidfile_child = cidfile_path.clone();
 
-    let start = Instant::now();
-
-    match unsafe { libc::fork() } {
-        -1 => Err(anyhow!("fork failed: {}", std::io::Error::last_os_error())),
-        0 => {
-            // ── Child process ──────────────────────────────────────────────
-            // TODO don't include test setup in cgroup
-            #[cfg(feature = "cgroup")]
-            if let Some(ref cg) = cgroup {
-                cg.enter();
-            }
-
-            if let Some(ref image) = docker_owned {
-                // Docker mode: write a runner script with container-internal paths,
-                // then exec `docker run` mounting the tmp dir as /attest.
-                let container_dir = Path::new("/attest");
-                let container_functions = container_dir.join("functions.sh");
-                let runner_content = build_runner_script(
-                    &test_name_owned,
-                    &container_functions,
-                    container_dir,
-                    &[], // strace wrappers reference host paths; skip in docker mode
-                );
-                let runner_path = tmp_path_child.join("runner.sh");
-                if let Err(e) = std::fs::write(&runner_path, &runner_content) {
-                    eprintln!("failed to write runner.sh: {e}");
-                    unsafe { libc::_exit(1) };
-                }
-                let mount = format!("{}:/attest", tmp_path_child.display());
-                let mut cmd = Command::new("docker");
-                // No --rm: the container is removed by PendingTest::drop() after
-                // cgroup stats have been read from the container's cgroup directory.
-                cmd.args(["run", "-v", &mount]);
-                #[cfg(feature = "cgroup")]
-                if let Some(ref cidfile) = cidfile_child {
-                    cmd.arg("--cidfile").arg(cidfile);
-                }
-                #[cfg(not(feature = "cgroup"))]
-                cmd.arg("--rm");
-                cmd.args([image.as_str(), shell_owned.as_str(), "/attest/runner.sh"]);
-                let err = cmd.exec();
-                eprintln!("exec docker failed: {err}");
-                unsafe { libc::_exit(1) };
-            }
-
-            let runner_content = build_runner_script(
-                &test_name_owned,
-                &script_path,
-                &tmp_path_child,
-                &strace_owned,
-            );
-
-            // Exec <shell> -c <script> <source_path>: replaces this child
-            // image entirely. Passing source_path as argv[0] makes $0 inside
-            // the test functions refer to the original script, not the runner.
-            // The shell is determined by the source file's shebang, defaulting to bash.
-            let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
-            let err = Command::new(&shell_owned)
-                .args(["-c", &runner_content, &source_str])
-                .exec();
-            eprintln!("exec {} failed: {err}", shell_owned);
-            unsafe { libc::_exit(1) };
+    let mut cmd = if let Some(image) = docker {
+        // Docker mode: write a runner script with container-internal paths,
+        // then run `docker run` mounting the context dir as /attest.
+        let container_dir = Path::new("/attest");
+        let container_functions = container_dir.join("functions.sh");
+        let runner_content = build_runner_script(
+            test_name,
+            &container_functions,
+            container_dir,
+            &[], // strace wrappers reference host paths; skip in docker mode
+        );
+        let runner_path = context.join("runner.sh");
+        std::fs::write(&runner_path, &runner_content)?;
+        let mount = format!("{}:/attest", context.display());
+        let mut cmd = Command::new("docker");
+        // No --rm (with cgroup feature): the container is removed by
+        // PendingTest::drop() after cgroup stats have been read from the
+        // container's cgroup directory.
+        cmd.args(["run", "-v", &mount]);
+        #[cfg(feature = "cgroup")]
+        if let Some(ref cidfile) = cidfile_path {
+            cmd.arg("--cidfile").arg(cidfile);
         }
-        child_pid => {
-            // ── Parent process ─────────────────────────────────────────────
-            Ok(PendingTest {
-                pid: child_pid,
-                reaped: false,
-                timed_out: false,
-                name: test_name.to_string(),
-                start,
-                context: Some(context),
-                source_path: source_path_owned,
-                #[cfg(feature = "cgroup")]
-                cgroup,
-                #[cfg(feature = "cgroup")]
-                docker_cidfile: cidfile_path,
-            })
+        #[cfg(not(feature = "cgroup"))]
+        cmd.arg("--rm");
+        cmd.args([image, shell.as_str(), "/attest/runner.sh"]);
+        cmd
+    } else {
+        let runner_content = build_runner_script(test_name, &script_path, &context, strace);
+        // <shell> -c <script> <source_path>: passing source_path as argv[0]
+        // makes $0 inside the test functions refer to the original script.
+        let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
+        let mut cmd = Command::new(&shell);
+        cmd.args(["-c", &runner_content, &source_str]);
+        cmd
+    };
+
+    // Place the child into its cgroup after fork, before exec.
+    // TODO don't include test setup in cgroup
+    #[cfg(feature = "cgroup")]
+    if let Some(ref cg) = cgroup {
+        let procs_path = cg.procs_path();
+        unsafe {
+            cmd.pre_exec(move || {
+                let pid = std::process::id().to_string();
+                let _ = std::fs::write(&procs_path, pid);
+                Ok(())
+            });
         }
     }
+
+    let start = Instant::now();
+    let child = cmd.spawn().map_err(|e| anyhow!("spawn failed: {e}"))?;
+
+    Ok(PendingTest {
+        child,
+        timed_out: false,
+        name: test_name.to_string(),
+        start,
+        context: Some(context),
+        source_path: source_path_owned,
+        #[cfg(feature = "cgroup")]
+        cgroup,
+        #[cfg(feature = "cgroup")]
+        docker_cidfile: cidfile_path,
+    })
 }
 
-/// Build a `TestResult` from a `PendingTest` whose child has already been
-/// reaped with the given raw `waitpid` status.
-fn build_result(mut pending: PendingTest, status: libc::c_int) -> TestResult {
+/// Build a `TestResult` from a `PendingTest` whose child has already exited
+/// with the given status.
+fn build_result(mut pending: PendingTest, status: ExitStatus) -> TestResult {
     let duration = pending.start.elapsed();
     let timed_out = pending.timed_out;
-    let passed = !timed_out && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    let passed = !timed_out && status.success();
 
     // Read stats before dropping cgroup (which removes the directory).
     #[cfg(feature = "cgroup")]
@@ -630,21 +594,18 @@ mod tests {
 
     /// Blocking wait + build result, for tests only.
     fn wait_and_collect(mut pending: PendingTest) -> TestResult {
-        let mut status: libc::c_int = 0;
-        let ret = unsafe { libc::waitpid(pending.pid, &mut status, 0) };
-        assert!(ret > 0, "waitpid failed");
-        pending.reaped = true;
+        let status = pending.child.wait().expect("wait failed");
         build_result(pending, status)
     }
 
-    /// Parse `script` content and run `test_name` via fork_test + wait_and_collect.
+    /// Parse `script` content and run `test_name` via spawn_test + wait_and_collect.
     fn run_inline(script: &str, test_name: &str) -> TestResult {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("t.sh");
         fs::write(&path, script).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let ctx = TempDir::new().unwrap().keep();
-        let pending = fork_test(test_name, &tf.functions, &path, ctx, &[], &[], None).unwrap();
+        let pending = spawn_test(test_name, &tf.functions, &path, ctx, &[], &[], None).unwrap();
         wait_and_collect(pending)
     }
 
@@ -682,7 +643,7 @@ mod tests {
         fs::write(&path, script_content).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let ctx = TempDir::new().unwrap().keep();
-        let pending = fork_test(
+        let pending = spawn_test(
             "test_override",
             &tf.functions,
             &path,
