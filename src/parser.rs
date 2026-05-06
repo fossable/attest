@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use brush_parser::ast::{Command, CompoundCommand, CompoundList, FunctionDefinition, Program};
-use brush_parser::{Parser, ParserOptions, SourceInfo};
+use brush_parser::{Parser, ParserOptions};
 
 /// File containing tests.
 pub struct TestFile {
@@ -111,10 +111,7 @@ pub fn parse_test_file(path: &Path) -> anyhow::Result<TestFile> {
 
     let reader = BufReader::new(contents.as_bytes());
     let options = ParserOptions::default();
-    let source_info = SourceInfo {
-        source: path.display().to_string(),
-    };
-    let mut parser = Parser::new(reader, &options, &source_info);
+    let mut parser = Parser::new(reader, &options);
     let program = parser
         .parse_program()
         .map_err(|e| anyhow::anyhow!("parse error in {}: {e}", path.display()))?;
@@ -161,7 +158,7 @@ fn extract_from_pipeline(
         match cmd {
             Command::Function(func) => functions.push(func.clone()),
             Command::Compound(compound, _) => extract_from_compound(compound, functions),
-            Command::Simple(_) | Command::ExtendedTest(_) => {}
+            Command::Simple(_) | Command::ExtendedTest(..) => {}
         }
     }
 }
@@ -201,7 +198,7 @@ fn extract_from_compound(compound: &CompoundCommand, functions: &mut Vec<Functio
             extract_from_compound_list(&w.0, functions);
             extract_from_compound_list(&w.1.list, functions);
         }
-        CompoundCommand::Arithmetic(_) => {}
+        CompoundCommand::Arithmetic(_) | CompoundCommand::Coprocess(_) => {}
     }
 }
 
