@@ -45,17 +45,15 @@ struct Cli {
     #[arg(short = 'x', long)]
     xtrace: bool,
 
-    /// Override a command by copying its resolved binary into the test context bin/ dir (can be specified multiple times)
+    /// Override a command in the test context bin/ dir. Accepts a path
+    /// (`/usr/bin/example` or `./bin/example`) or a mapping
+    /// (`example=/usr/bin/overridden`). Can be specified multiple times.
     #[arg(long)]
-    r#override: Vec<String>,
+    r#override: Vec<runner::OverrideSpec>,
 
     /// Trace a command with strace, saving output to the test context dir (can be specified multiple times)
     #[arg(long)]
     strace: Vec<String>,
-
-    /// Run tests inside the specified Docker container image
-    #[arg(long)]
-    docker: Option<String>,
 
     /// Kill a test and mark it as timed out after this many seconds (wall-clock time)
     #[arg(long)]
@@ -226,7 +224,6 @@ fn main() -> anyhow::Result<()> {
                 save_context: cli.save_context,
                 override_cmds: cli.r#override,
                 strace: cli.strace,
-                docker: cli.docker,
                 timeout: cli.timeout.map(std::time::Duration::from_secs_f64),
             };
 

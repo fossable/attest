@@ -79,46 +79,6 @@ impl TestCgroup {
         Some(std::time::Duration::from_micros(user + system))
     }
 
-    /// Locate the cgroup directory Docker created for a container identified by
-    /// its full container ID. Checks all standard Docker cgroup locations:
-    /// cgroupfs, root-daemon systemd scope, and rootless-daemon systemd scope
-    /// (relative to the current process's `user@<uid>.service` session base).
-    pub fn find_container_cgroup(cid: &str) -> Option<PathBuf> {
-        // cgroupfs driver
-        let cgroupfs = PathBuf::from("/sys/fs/cgroup/docker").join(cid);
-        if cgroupfs.exists() {
-            return Some(cgroupfs);
-        }
-        let scope_name = format!("docker-{cid}.scope");
-        // systemd driver, root dockerd
-        let system_scope = PathBuf::from("/sys/fs/cgroup/system.slice").join(&scope_name);
-        if system_scope.exists() {
-            return Some(system_scope);
-        }
-        // systemd driver, rootless dockerd: scope lives under user@<uid>.service
-        if let Some(session_base) = session_service_base() {
-            let user_scope = session_base.join(&scope_name);
-            if user_scope.exists() {
-                return Some(user_scope);
-            }
-        }
-        None
-    }
-
-    /// Read resource stats from an arbitrary cgroup v2 directory. Used to
-    /// collect stats for Docker containers whose cgroup path is known.
-    pub fn read_stats_at(path: &Path) -> ResourceStats {
-        ResourceStats {
-            cpu_user_usec: read_stat_field(path.join("cpu.stat"), "user_usec"),
-            cpu_system_usec: read_stat_field(path.join("cpu.stat"), "system_usec"),
-            memory_peak: read_single_u64(path.join("memory.peak"))
-                .or_else(|| read_single_u64(path.join("memory.current"))),
-            io_read_bytes: read_io_field(path, "rbytes"),
-            io_write_bytes: read_io_field(path, "wbytes"),
-            pids_peak: read_single_u64(path.join("pids.peak")),
-        }
-    }
-
     /// Read resource stats from the cgroup pseudo-files. Call this after the
     /// child has exited (waitpid returned) but before dropping the handle.
     pub fn read_stats(&self) -> ResourceStats {
@@ -247,26 +207,6 @@ fn read_stat_field(path: impl AsRef<std::path::Path>, field: &str) -> Option<u64
             None
         }
     })
-}
-
-/// Returns the `user@<uid>.service` cgroup directory for the current process,
-/// which is the base where rootless dockerd places container scopes.
-fn session_service_base() -> Option<PathBuf> {
-    let content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let rel = content
-        .lines()
-        .find(|l| l.starts_with("0::"))?
-        .strip_prefix("0::")?
-        .trim()
-        .trim_start_matches('/');
-    let mut path = PathBuf::from("/sys/fs/cgroup");
-    for component in rel.split('/') {
-        path = path.join(component);
-        if component.starts_with("user@") && component.ends_with(".service") {
-            return Some(path);
-        }
-    }
-    None
 }
 
 /// Sum a named field (e.g. `rbytes`) across all device lines in `io.stat`.

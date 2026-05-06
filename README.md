@@ -262,6 +262,15 @@ attest --parallel 1 .
 Every test runs in a temporary _context directory_ that collects logs and
 temporary files created by the test.
 
+### Containerized tests
+
+If your application requires some dependencies in a Docker container, you can
+run `attest` in a container with this recipe:
+
+```sh
+docker run --rm -v $(which attest):/bin/attest -v $(pwd):/tests <image name> attest /tests
+```
+
 ## Debugging tests
 
 ![](./.github/assets/diagnostic.gif)

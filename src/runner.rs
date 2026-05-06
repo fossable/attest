@@ -5,7 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -123,10 +123,6 @@ struct PendingTest {
     source_path: PathBuf,
     #[cfg(feature = "cgroup")]
     cgroup: Option<crate::cgroup::TestCgroup>,
-    /// Path to the Docker cidfile written by `docker run --cidfile`. Set only
-    /// for Docker tests; used to find the container's cgroup and clean up.
-    #[cfg(feature = "cgroup")]
-    docker_cidfile: Option<PathBuf>,
 }
 
 impl Drop for PendingTest {
@@ -135,23 +131,54 @@ impl Drop for PendingTest {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
-        // Docker containers are not removed by SIGKILL on the CLI process; force-remove them.
-        if let Some(ref cidfile) = self.docker_cidfile {
-            if let Ok(cid) = std::fs::read_to_string(cidfile) {
-                let cid = cid.trim().to_string();
-                if !cid.is_empty() {
-                    let _ = Command::new("docker")
-                        .args(["rm", "-f", &cid])
-                        .stderr(Stdio::null())
-                        .stdout(Stdio::null())
-                        .status();
-                }
-            }
-        }
         if let Some(ref dir) = self.context {
             let _ = std::fs::remove_dir_all(dir);
         }
         // cgroup field drops here, removing the cgroup directory
+    }
+}
+
+/// A `--override` spec: a binary to copy into the test context's `bin/` dir.
+///
+/// Accepted CLI forms:
+/// - `/usr/bin/example` (absolute path) — copied as `bin/example`
+/// - `./bin/example` (relative path) — copied as `bin/example`
+/// - `example=/usr/bin/override` — copies `/usr/bin/override` to `bin/example`
+#[derive(Clone, Debug)]
+pub struct OverrideSpec {
+    pub name: String,
+    pub source: PathBuf,
+}
+
+impl std::str::FromStr for OverrideSpec {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if let Some((name, path)) = s.split_once('=') {
+            if name.is_empty() || path.is_empty() {
+                return Err(format!("invalid override mapping: {s}"));
+            }
+            if name.contains('/') {
+                return Err(format!("override name must not contain '/': {name}"));
+            }
+            return Ok(OverrideSpec {
+                name: name.to_string(),
+                source: PathBuf::from(path),
+            });
+        }
+
+        let path = PathBuf::from(s);
+        if !s.contains('/') {
+            return Err(format!(
+                "override `{s}` must be a path (e.g. `/usr/bin/{s}`) or a mapping (e.g. `{s}=/path/to/bin`)"
+            ));
+        }
+        let name = path
+            .file_name()
+            .ok_or_else(|| format!("invalid override path: {s}"))?
+            .to_string_lossy()
+            .into_owned();
+        Ok(OverrideSpec { name, source: path })
     }
 }
 
@@ -163,9 +190,8 @@ pub struct RunConfig {
     /// When set, each test's context directory is created here and left on exit.
     /// When unset, context dirs are temporary and cleaned up automatically.
     pub save_context: Option<PathBuf>,
-    pub override_cmds: Vec<String>,
+    pub override_cmds: Vec<OverrideSpec>,
     pub strace: Vec<String>,
-    pub docker: Option<String>,
     /// Wall-clock timeout per test. Tests exceeding this are killed and marked as timed out.
     pub timeout: Option<Duration>,
 }
@@ -174,19 +200,6 @@ pub fn run_all_tests(
     tests: Vec<(&str, &[FunctionDefinition], &Path)>,
     config: &RunConfig,
 ) -> Result<Vec<TestResult>> {
-    if let Some(ref image) = config.docker {
-        debug!(image = image, "Pulling docker image");
-        let pull = Command::new("docker")
-            .args(["pull", image])
-            .stderr(Stdio::null())
-            .stdout(Stdio::null())
-            .status()
-            .map_err(|e| anyhow!("failed to run docker pull: {e}"))?;
-        if !pull.success() {
-            return Err(anyhow!("docker pull {image} failed"));
-        }
-    }
-
     let mut results = Vec::new();
     let total = tests.len();
     let status = output::StatusDisplay::new(total, config.json);
@@ -221,7 +234,6 @@ pub fn run_all_tests(
                 contexts_dir.join(test_name),
                 &config.override_cmds,
                 &config.strace,
-                config.docker.as_deref(),
             )?);
         } else {
             break;
@@ -309,7 +321,6 @@ pub fn run_all_tests(
                     contexts_dir.join(test_name),
                     &config.override_cmds,
                     &config.strace,
-                    config.docker.as_deref(),
                 )?);
             }
         }
@@ -362,9 +373,8 @@ fn spawn_test(
     all_functions: &[FunctionDefinition],
     source_path: &Path,
     context: PathBuf,
-    override_cmds: &[String],
+    override_cmds: &[OverrideSpec],
     strace: &[String],
-    docker: Option<&str>,
 ) -> Result<PendingTest> {
     if std::fs::exists(&context)? {
         std::fs::remove_dir_all(&context)?;
@@ -384,13 +394,18 @@ fn spawn_test(
         let bin: &Path = &context.join("bin");
         std::fs::create_dir_all(bin)?;
 
-        for cmd in override_cmds {
-            let src =
-                which::which(cmd).map_err(|_| anyhow!("--override: command not found: {cmd}"))?;
-            let dst = bin.join(src.file_name().expect("'which' result must have filename"));
+        for spec in override_cmds {
+            let src = &spec.source;
+            if !src.exists() {
+                return Err(anyhow!(
+                    "--override: source path does not exist: {}",
+                    src.display()
+                ));
+            }
+            let dst = bin.join(&spec.name);
 
             debug!(src=%src.display(), dst=%dst.display(), "Overriding command");
-            std::fs::copy(&src, &dst)?;
+            std::fs::copy(src, &dst)?;
         }
     }
 
@@ -403,52 +418,15 @@ fn spawn_test(
         .unwrap_or_else(|_| source_path.to_path_buf());
     let shell = crate::discovery::get_script_shell(&source_path_owned);
 
-    // For Docker tests we skip creating our own cgroup and let Docker manage it.
     #[cfg(feature = "cgroup")]
-    let cgroup = if docker.is_none() {
-        crate::cgroup::TestCgroup::try_create(test_name)
-    } else {
-        None
-    };
-    #[cfg(feature = "cgroup")]
-    let cidfile_path: Option<PathBuf> = docker.map(|_| context.join("container.cid"));
+    let cgroup = crate::cgroup::TestCgroup::try_create(test_name);
 
-    let mut cmd = if let Some(image) = docker {
-        // Docker mode: write a runner script with container-internal paths,
-        // then run `docker run` mounting the context dir as /attest.
-        let container_dir = Path::new("/attest");
-        let container_functions = container_dir.join("functions.sh");
-        let runner_content = build_runner_script(
-            test_name,
-            &container_functions,
-            container_dir,
-            &[], // strace wrappers reference host paths; skip in docker mode
-        );
-        let runner_path = context.join("runner.sh");
-        std::fs::write(&runner_path, &runner_content)?;
-        let mount = format!("{}:/attest", context.display());
-        let mut cmd = Command::new("docker");
-        // No --rm (with cgroup feature): the container is removed by
-        // PendingTest::drop() after cgroup stats have been read from the
-        // container's cgroup directory.
-        cmd.args(["run", "-v", &mount]);
-        #[cfg(feature = "cgroup")]
-        if let Some(ref cidfile) = cidfile_path {
-            cmd.arg("--cidfile").arg(cidfile);
-        }
-        #[cfg(not(feature = "cgroup"))]
-        cmd.arg("--rm");
-        cmd.args([image, shell.as_str(), "/attest/runner.sh"]);
-        cmd
-    } else {
-        let runner_content = build_runner_script(test_name, &script_path, &context, strace);
-        // <shell> -c <script> <source_path>: passing source_path as argv[0]
-        // makes $0 inside the test functions refer to the original script.
-        let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
-        let mut cmd = Command::new(&shell);
-        cmd.args(["-c", &runner_content, &source_str]);
-        cmd
-    };
+    let runner_content = build_runner_script(test_name, &script_path, &context, strace);
+    // <shell> -c <script> <source_path>: passing source_path as argv[0]
+    // makes $0 inside the test functions refer to the original script.
+    let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
+    let mut cmd = Command::new(&shell);
+    cmd.args(["-c", &runner_content, &source_str]);
 
     // Place the child into its cgroup after fork, before exec.
     // TODO don't include test setup in cgroup
@@ -476,8 +454,6 @@ fn spawn_test(
         source_path: source_path_owned,
         #[cfg(feature = "cgroup")]
         cgroup,
-        #[cfg(feature = "cgroup")]
-        docker_cidfile: cidfile_path,
     })
 }
 
@@ -490,21 +466,7 @@ fn build_result(mut pending: PendingTest, status: ExitStatus) -> TestResult {
 
     // Read stats before dropping cgroup (which removes the directory).
     #[cfg(feature = "cgroup")]
-    let resources = if let Some(ref cidfile) = pending.docker_cidfile {
-        // Docker test: find the container's own cgroup and read stats from it.
-        // The container is removed by Drop after this function returns.
-        (|| -> Option<crate::cgroup::ResourceStats> {
-            let cid = std::fs::read_to_string(cidfile).ok()?;
-            let cid = cid.trim();
-            if cid.is_empty() {
-                return None;
-            }
-            let cgroup_path = crate::cgroup::TestCgroup::find_container_cgroup(cid)?;
-            Some(crate::cgroup::TestCgroup::read_stats_at(&cgroup_path))
-        })()
-    } else {
-        pending.cgroup.as_ref().map(|cg| cg.read_stats())
-    };
+    let resources = pending.cgroup.as_ref().map(|cg| cg.read_stats());
 
     TestResult {
         name: pending.name.clone(),
@@ -605,7 +567,7 @@ mod tests {
         fs::write(&path, script).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let ctx = TempDir::new().unwrap().keep();
-        let pending = spawn_test(test_name, &tf.functions, &path, ctx, &[], &[], None).unwrap();
+        let pending = spawn_test(test_name, &tf.functions, &path, ctx, &[], &[]).unwrap();
         wait_and_collect(pending)
     }
 
@@ -643,14 +605,17 @@ mod tests {
         fs::write(&path, script_content).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let ctx = TempDir::new().unwrap().keep();
+        let spec = OverrideSpec {
+            name: "true".into(),
+            source: which::which("true").unwrap(),
+        };
         let pending = spawn_test(
             "test_override",
             &tf.functions,
             &path,
             ctx,
-            &["true".to_string()],
+            std::slice::from_ref(&spec),
             &[],
-            None,
         )
         .unwrap();
         let result = wait_and_collect(pending);
@@ -710,7 +675,6 @@ mod tests {
             save_context: None,
             override_cmds: vec![],
             strace: vec![],
-            docker: None,
             timeout: None,
         };
 
@@ -749,7 +713,6 @@ mod tests {
             save_context: None,
             override_cmds: vec![],
             strace: vec![],
-            docker: None,
             timeout: None,
         };
 
@@ -788,7 +751,6 @@ mod tests {
             save_context: None,
             override_cmds: vec![],
             strace: vec![],
-            docker: None,
             timeout: None,
         };
 
@@ -827,7 +789,6 @@ mod tests {
             save_context: None,
             override_cmds: vec![],
             strace: vec![],
-            docker: None,
             timeout: Some(std::time::Duration::from_millis(200)),
         };
 

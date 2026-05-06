@@ -103,7 +103,7 @@ testReadInput() {
 ## Example: testing a CLI command
 
 ```sh
-#!/usr/bin/env attest
+#!/usr/bin/env bash
 
 testHelp() {
 	md5sum --help
@@ -132,8 +132,8 @@ testHello() {
 - Use comments to explain non-obvious assertions, not obvious ones
 - Comments on test functions themselves should be "documentation style" with
   `##`.
-- Typically don't redirect stderr or stdout to /dev/null in tests because it
-  might be useful for debugging.
+- Avoid redirecting stderr or stdout to /dev/null because it might be useful for
+  debugging.
 
 ## General test writing practice
 

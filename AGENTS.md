@@ -13,7 +13,7 @@
   stdout to `stdout.log` and stderr to `xtrace.log`, enables `set -ex`, sources
   the script, then invokes the test function by name. Parallel by default via
   `fork(2)` with configurable parallelism (`--parallel`). Supports `--timeout`,
-  `--bail`, `--override`, `--strace`, and `--docker`.
+  `--bail`, `--override`, and `--strace`.
 - `src/diagnostics.rs` - On failure, parses `xtrace.log` to find the last
   executed command, maps it back to the original source file, and renders an
   annotate-snippets error snippet. Also shows inline character-level diffs for
@@ -43,12 +43,11 @@ implicit assertion - if it exits nonzero, the test fails. Non-test functions
 - `--bail` — stop after first failure
 - `--filter [FILE/]PATTERN` — run only matching tests (`*` wildcards, prefix
   match)
-- `--override CMD` — copy the resolved binary into `bin/` so tests use it
-  exclusively
+- `--override SPEC` — copy a binary into the test context `bin/` dir so tests
+  use it exclusively. SPEC is either a path (`/usr/bin/example` or
+  `./bin/example`) or a mapping (`example=/usr/bin/override`)
 - `--strace CMD` — wrap CMD with strace, output saved to `strace/CMD.log` in the
   test context dir
-- `--docker IMAGE` — run each test inside a Docker container with the test
-  context dir mounted at `/attest`
 - `--xtrace` — stream xtrace output live (one test at a time)
 - `--save-context DIR` — save test context to DIR for debugging
 
