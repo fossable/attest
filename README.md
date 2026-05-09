@@ -271,6 +271,18 @@ run `attest` in a container with this recipe:
 docker run --rm -v $(which attest):/bin/attest -v $(pwd):/tests <image name> attest /tests
 ```
 
+### Fuzz testing
+
+If your application spawns subprocesses, `attest` can randomly inflate the
+timing of those subprocesses at random:
+
+```sh
+attest --fuzz examples/race_condition.test
+```
+
+This works by choosing a subprocess at random and sending `SIGSTOP` followed by
+`SIGCONT`.
+
 ## Debugging tests
 
 ![](./.github/assets/diagnostic.gif)

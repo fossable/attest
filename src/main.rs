@@ -24,7 +24,7 @@ struct Cli {
     #[arg(add = ArgValueCompleter::new(complete_tests))]
     path: Option<String>,
 
-    /// Maximum number of tests to run in parallel (defaults to number of CPU cores)
+    /// Maximum number of tests to run in parallel
     #[arg(long, default_value_t = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))]
     parallel: usize,
 
@@ -63,6 +63,11 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
+    /// Randomly pause and resume individual descendant processes of each test to
+    /// introduce timing non-determinism
+    #[arg(long)]
+    fuzz: bool,
+
     /// Enable debug logging
     #[arg(short = 'd', long)]
     debug: bool,
@@ -81,7 +86,7 @@ enum Commands {
         #[arg(long, add = ArgValueCompleter::new(complete_tests))]
         filter: Option<String>,
     },
-    /// Print the AI skill document for writing .test files
+    /// Print AI agent skill for writing .test files
     Skill,
 }
 
@@ -225,6 +230,7 @@ fn main() -> anyhow::Result<()> {
                 override_cmds: cli.r#override,
                 strace: cli.strace,
                 timeout: cli.timeout.map(std::time::Duration::from_secs_f64),
+                fuzz: cli.fuzz,
             };
 
             let test_refs: Vec<(

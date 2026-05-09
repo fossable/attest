@@ -1,3 +1,10 @@
+---
+name: attest
+description:
+  Write integration/acceptance/end-to-end tests for an application using the
+  attest framework.
+---
+
 # Writing .test files for attest
 
 attest is a shell-based test framework. Test files are plain shell scripts with

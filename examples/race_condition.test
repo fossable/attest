@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+## Test my favorite shell race condition. If `grep -q` exits before the left command
+## finishes writing to the pipe buffer, the left command fails with a "closed pipe"
+## error.
+testGrepQ() {
+	set -o pipefail
+
+	(
+		echo 'A'
+		echo 'B'
+	) | grep -q 'A'
+}

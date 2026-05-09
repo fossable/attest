@@ -5,7 +5,7 @@ with pkgs;
 
 mkShell rec {
   nativeBuildInputs =
-    [ pkg-config cargo rustc rust-analyzer rustfmt clippy vhs ];
+    [ pkg-config cargo rustc rust-analyzer rustfmt clippy vhs strace ];
   buildInputs = [ ];
   LD_LIBRARY_PATH = lib.makeLibraryPath buildInputs;
 }

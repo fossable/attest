@@ -194,6 +194,9 @@ pub struct RunConfig {
     pub strace: Vec<String>,
     /// Wall-clock timeout per test. Tests exceeding this are killed and marked as timed out.
     pub timeout: Option<Duration>,
+    /// Randomly SIGSTOP/SIGCONT individual descendant processes of each test to introduce
+    /// timing non-determinism.
+    pub fuzz: bool,
 }
 
 pub fn run_all_tests(
@@ -209,6 +212,10 @@ pub fn run_all_tests(
     let mut test_iter = tests.iter();
     let mut pending_list: Vec<PendingTest> = Vec::new();
     let mut bail_flag = false;
+    let mut rng: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0xdeadbeef_cafebabe);
     let mut xtrace = if config.xtrace {
         Some(XtraceStreamer::new())
     } else {
@@ -262,6 +269,47 @@ pub fn run_all_tests(
                 if !pending.timed_out && pending.start.elapsed() > timeout {
                     let _ = pending.child.kill();
                     pending.timed_out = true;
+                }
+            }
+        }
+
+        // Randomly pause/resume individual descendant processes to introduce timing fuzziness.
+        // Each tick either pauses one random running process OR resumes one random stopped
+        // process — never both.
+        if config.fuzz {
+            for pending in pending_list.iter_mut() {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let descendants = collect_descendants(pending.child.id());
+                if rng % 2 == 0 {
+                    // Resume a random stopped descendant.
+                    let stopped: Vec<u32> = descendants
+                        .iter()
+                        .copied()
+                        .filter(|&pid| process_state(pid) == Some('T'))
+                        .collect();
+                    if !stopped.is_empty() {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        let chosen = stopped[(rng as usize) % stopped.len()];
+                        unsafe { libc::kill(chosen as libc::pid_t, libc::SIGCONT) };
+                    }
+                } else {
+                    // Pause a random running descendant.
+                    let running: Vec<u32> = descendants
+                        .iter()
+                        .copied()
+                        .filter(|&pid| process_state(pid) != Some('T'))
+                        .collect();
+                    if !running.is_empty() {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        let chosen = running[(rng as usize) % running.len()];
+                        unsafe { libc::kill(chosen as libc::pid_t, libc::SIGSTOP) };
+                    }
                 }
             }
         }
@@ -523,6 +571,33 @@ fn build_runner_script(
     s
 }
 
+/// Collect the PID of `root` and all of its descendants by walking
+/// `/proc/<pid>/task/<pid>/children` recursively.
+fn collect_descendants(root: u32) -> Vec<u32> {
+    let mut result = vec![root];
+    let mut queue = vec![root];
+    while let Some(pid) = queue.pop() {
+        let path = format!("/proc/{}/task/{}/children", pid, pid);
+        if let Ok(s) = std::fs::read_to_string(path) {
+            for child in s.split_whitespace().filter_map(|t| t.parse::<u32>().ok()) {
+                result.push(child);
+                queue.push(child);
+            }
+        }
+    }
+    result
+}
+
+/// Read the single-character process state from `/proc/<pid>/stat`.
+/// Returns `None` if the file cannot be read (e.g. the process has already exited).
+fn process_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // Format: "pid (comm) state ..."  — comm may contain spaces/parens, so
+    // find the *last* ')' to reliably locate the state field.
+    let after_comm = stat.rfind(')')?.checked_add(2)?;
+    stat[after_comm..].chars().next()
+}
+
 fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> Result<()> {
     let strace_bin = working_dir.join("strace_bin");
     std::fs::create_dir_all(&strace_bin)?;
@@ -676,6 +751,7 @@ mod tests {
             override_cmds: vec![],
             strace: vec![],
             timeout: None,
+            fuzz: false,
         };
 
         let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
@@ -714,6 +790,7 @@ mod tests {
             override_cmds: vec![],
             strace: vec![],
             timeout: None,
+            fuzz: false,
         };
 
         let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
@@ -752,6 +829,7 @@ mod tests {
             override_cmds: vec![],
             strace: vec![],
             timeout: None,
+            fuzz: false,
         };
 
         let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
@@ -790,6 +868,7 @@ mod tests {
             override_cmds: vec![],
             strace: vec![],
             timeout: Some(std::time::Duration::from_millis(200)),
+            fuzz: false,
         };
 
         let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = tf
