@@ -1,7 +1,7 @@
 Output .github/assets/serial.gif
 
 Set Width 1000
-Set Height 300
+Set Height 450
 
 Hide
 Type "alias attest=./target/debug/attest && clear"
