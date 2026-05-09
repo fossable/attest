@@ -281,7 +281,78 @@ attest --fuzz examples/race_condition.test
 ```
 
 This works by choosing a subprocess at random and sending `SIGSTOP` followed by
-`SIGCONT`.
+`SIGCONT`. This option also works nicely with `--repeat`.
+
+<details>
+<summary>Example</summary>
+
+Without `--fuzz`, you might not realize there's a nasty race condition hiding in
+this file:
+
+```
+❯ attest --parallel 1 --repeat 10 examples/race_condition.test
+PASS  testGrepQ#1                              (1.06s)
+      cpu=7.8ms+4.8ms  mem=2.8MiB  pids=5
+PASS  testGrepQ#2                              (1.07s)
+      cpu=6.2ms+6.2ms  mem=3.1MiB  pids=5
+PASS  testGrepQ#3                              (1.07s)
+      cpu=6.2ms+6.2ms  mem=2.6MiB  pids=5
+PASS  testGrepQ#4                              (1.07s)
+      cpu=6.2ms+6.2ms  mem=3.4MiB  pids=5
+PASS  testGrepQ#5                              (1.07s)
+      cpu=6.3ms+6.3ms  mem=3.4MiB  pids=5
+PASS  testGrepQ#6                              (1.06s)
+      cpu=8.7ms+3.7ms  mem=3.4MiB  pids=5
+PASS  testGrepQ#7                              (1.07s)
+      cpu=5.9ms+6.9ms  mem=3.0MiB  pids=5
+PASS  testGrepQ#8                              (1.07s)
+      cpu=6.3ms+6.3ms  mem=3.1MiB  pids=5
+PASS  testGrepQ#9                              (1.06s)
+      cpu=6.1ms+6.1ms  mem=3.1MiB  pids=5
+PASS  testGrepQ#10                             (1.07s)
+      cpu=6.2ms+6.2ms  mem=2.8MiB  pids=5
+
+Results: 10 passed, 10 total
+Time:   10.69s
+```
+
+Now let's add some fuzziness to the timing:
+
+```
+❯ attest --parallel 1 --fuzz 0.9 --repeat 10 examples/race_condition.test                                                                                                                                                                10s
+PASS  testGrepQ#1                              (3.47s)
+      cpu=5.5ms+7.3ms  mem=2.8MiB  pids=5
+FAIL  testGrepQ#2                              (4.09s)
+      cpu=6.7ms+6.0ms  mem=3.2MiB  pids=5
+FAIL  testGrepQ#3                              (5.10s)
+      cpu=4.7ms+7.8ms  mem=2.9MiB  pids=5
+PASS  testGrepQ#4                              (3.59s)
+      cpu=6.3ms+6.3ms  mem=3.5MiB  pids=5
+FAIL  testGrepQ#5                              (2.39s)
+      cpu=5.8ms+6.8ms  mem=3.1MiB  pids=5
+PASS  testGrepQ#6                              (6.51s)
+      cpu=5.3ms+7.4ms  mem=3.1MiB  pids=5
+FAIL  testGrepQ#7                              (3.08s)
+      cpu=7.1ms+5.7ms  mem=3.1MiB  pids=5
+FAIL  testGrepQ#8                              (3.34s)
+      cpu=4.3ms+8.1ms  mem=3.4MiB  pids=5
+PASS  testGrepQ#9                              (2.68s)
+      cpu=6.3ms+6.3ms  mem=3.1MiB  pids=5
+FAIL  testGrepQ#10                             (2.08s)
+      cpu=6.2ms+6.2ms  mem=2.6MiB  pids=5
+
+Results: 4 passed, 6 failed, 10 total
+Time:   36.35s
+```
+
+We were able to shake out the race condition by adding random delays in the
+test. The `grep -q` example above is obviously contrived, but imagine you were
+checking for firewall rules with `iptables | grep -q`.
+
+You'll also notice the test took over 3 times longer. You can adjust how
+aggressive the fuzzer is by passing a higher number to `--fuzz`.
+
+</details>
 
 ## Debugging tests
 

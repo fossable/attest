@@ -8,6 +8,10 @@ testGrepQ() {
 
 	(
 		echo 'A'
+		sleep 1
 		echo 'B'
-	) | grep -q 'A'
+	) | (
+		sleep 1
+		grep -q 'A'
+	)
 }

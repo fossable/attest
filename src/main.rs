@@ -10,6 +10,20 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use std::path::{Path, PathBuf};
 
+fn parse_fuzz(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid number", s))?;
+    if v > 0.0 && v < 1.0 {
+        Ok(v)
+    } else {
+        Err(format!(
+            "fuzz value must be strictly between 0 and 1, got {}",
+            v
+        ))
+    }
+}
+
 #[derive(Parser)]
 #[command(
     version,
@@ -64,9 +78,14 @@ struct Cli {
     json: bool,
 
     /// Randomly pause and resume individual descendant processes of each test to
-    /// introduce timing non-determinism
-    #[arg(long)]
-    fuzz: bool,
+    /// introduce timing non-determinism. Optionally accepts an aggressiveness value
+    /// in (0,1) where higher values pause processes more frequently (default: 0.5)
+    #[arg(long, num_args = 0..=1, default_missing_value = "0.5", value_parser = parse_fuzz)]
+    fuzz: Option<f64>,
+
+    /// Run each test this many times (default: 1)
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
 
     /// Enable debug logging
     #[arg(short = 'd', long)]
@@ -207,7 +226,12 @@ fn main() -> anyhow::Result<()> {
             let filter = cli.filter.or(inline_filter);
             let pattern = filter.as_deref().map(parser::TestPattern::parse);
             let files = discovery::discover_test_files(&path)?;
-            let mut all_tests = Vec::new();
+            let mut all_tests: Vec<(
+                String,
+                String,
+                Vec<brush_parser::ast::FunctionDefinition>,
+                std::path::PathBuf,
+            )> = Vec::new();
             for file in &files {
                 let test_file = parser::parse_test_file(file)?;
                 let functions = test_file.functions;
@@ -217,7 +241,19 @@ fn main() -> anyhow::Result<()> {
                     {
                         continue;
                     }
-                    all_tests.push((test.name, functions.clone(), file.clone()));
+                    for i in 1..=cli.repeat {
+                        let display = if cli.repeat > 1 {
+                            format!("{}#{}", test.name, i)
+                        } else {
+                            test.name.clone()
+                        };
+                        all_tests.push((
+                            display,
+                            test.name.clone(),
+                            functions.clone(),
+                            file.clone(),
+                        ));
+                    }
                 }
             }
 
@@ -235,11 +271,19 @@ fn main() -> anyhow::Result<()> {
 
             let test_refs: Vec<(
                 &str,
+                &str,
                 &[brush_parser::ast::FunctionDefinition],
                 &std::path::Path,
             )> = all_tests
                 .iter()
-                .map(|(name, funcs, src)| (name.as_str(), funcs.as_slice(), src.as_path()))
+                .map(|(display, fn_name, funcs, src)| {
+                    (
+                        display.as_str(),
+                        fn_name.as_str(),
+                        funcs.as_slice(),
+                        src.as_path(),
+                    )
+                })
                 .collect();
 
             let results = runner::run_all_tests(test_refs, &config)?;

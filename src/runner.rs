@@ -7,7 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::output;
 
@@ -196,11 +196,11 @@ pub struct RunConfig {
     pub timeout: Option<Duration>,
     /// Randomly SIGSTOP/SIGCONT individual descendant processes of each test to introduce
     /// timing non-determinism.
-    pub fuzz: bool,
+    pub fuzz: Option<f64>,
 }
 
 pub fn run_all_tests(
-    tests: Vec<(&str, &[FunctionDefinition], &Path)>,
+    tests: Vec<(&str, &str, &[FunctionDefinition], &Path)>,
     config: &RunConfig,
 ) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
@@ -209,7 +209,7 @@ pub fn run_all_tests(
     let wall_start = Instant::now();
 
     let max_parallel = config.parallel.max(1);
-    let mut test_iter = tests.iter();
+    let mut test_iter = tests.into_iter();
     let mut pending_list: Vec<PendingTest> = Vec::new();
     let mut bail_flag = false;
     let mut rng: u64 = std::time::SystemTime::now()
@@ -233,12 +233,13 @@ pub fn run_all_tests(
 
     // Seed the initial batch up to max_parallel.
     while pending_list.len() < max_parallel {
-        if let Some((test_name, all_functions, source_path)) = test_iter.next() {
+        if let Some((display_name, fn_name, all_functions, source_path)) = test_iter.next() {
             pending_list.push(spawn_test(
-                test_name,
+                display_name,
+                fn_name,
                 all_functions,
                 source_path,
-                contexts_dir.join(test_name),
+                contexts_dir.join(display_name),
                 &config.override_cmds,
                 &config.strace,
             )?);
@@ -276,13 +277,17 @@ pub fn run_all_tests(
         // Randomly pause/resume individual descendant processes to introduce timing fuzziness.
         // Each tick either pauses one random running process OR resumes one random stopped
         // process — never both.
-        if config.fuzz {
+        if let Some(fuzz_level) = config.fuzz {
             for pending in pending_list.iter_mut() {
                 rng ^= rng << 13;
                 rng ^= rng >> 7;
                 rng ^= rng << 17;
-                let descendants = collect_descendants(pending.child.id());
-                if rng % 2 == 0 {
+                let test_pid = pending.child.id();
+                let descendants: Vec<u32> = collect_descendants(test_pid)
+                    .into_iter()
+                    .filter(|&pid| pid != test_pid)
+                    .collect();
+                if (rng as f64) / (u64::MAX as f64) >= fuzz_level {
                     // Resume a random stopped descendant.
                     let stopped: Vec<u32> = descendants
                         .iter()
@@ -294,7 +299,9 @@ pub fn run_all_tests(
                         rng ^= rng >> 7;
                         rng ^= rng << 17;
                         let chosen = stopped[(rng as usize) % stopped.len()];
-                        unsafe { libc::kill(chosen as libc::pid_t, libc::SIGCONT) };
+                        if unsafe { libc::kill(chosen as libc::pid_t, libc::SIGCONT) } == 0 {
+                            trace!(pid = chosen, "Resumed subprocess");
+                        }
                     }
                 } else {
                     // Pause a random running descendant.
@@ -308,7 +315,9 @@ pub fn run_all_tests(
                         rng ^= rng >> 7;
                         rng ^= rng << 17;
                         let chosen = running[(rng as usize) % running.len()];
-                        unsafe { libc::kill(chosen as libc::pid_t, libc::SIGSTOP) };
+                        if unsafe { libc::kill(chosen as libc::pid_t, libc::SIGSTOP) } == 0 {
+                            trace!(pid = chosen, "Paused subprocess");
+                        }
                     }
                 }
             }
@@ -361,12 +370,15 @@ pub fn run_all_tests(
             }
             results.push(result);
 
-            if !bail_flag && let Some((test_name, all_functions, source_path)) = test_iter.next() {
+            if !bail_flag
+                && let Some((display_name, fn_name, all_functions, source_path)) = test_iter.next()
+            {
                 pending_list.push(spawn_test(
-                    test_name,
+                    display_name,
+                    fn_name,
                     all_functions,
                     source_path,
-                    contexts_dir.join(test_name),
+                    contexts_dir.join(display_name),
                     &config.override_cmds,
                     &config.strace,
                 )?);
@@ -417,7 +429,8 @@ pub fn run_all_tests(
 /// Spawn a child process that will run the test. Returns a `PendingTest` that
 /// the caller must reap (or simply drop to kill+clean up).
 fn spawn_test(
-    test_name: &str,
+    display_name: &str,
+    fn_name: &str,
     all_functions: &[FunctionDefinition],
     source_path: &Path,
     context: PathBuf,
@@ -467,9 +480,9 @@ fn spawn_test(
     let shell = crate::discovery::get_script_shell(&source_path_owned);
 
     #[cfg(feature = "cgroup")]
-    let cgroup = crate::cgroup::TestCgroup::try_create(test_name);
+    let cgroup = crate::cgroup::TestCgroup::try_create(display_name);
 
-    let runner_content = build_runner_script(test_name, &script_path, &context, strace);
+    let runner_content = build_runner_script(fn_name, &script_path, &context, strace);
     // <shell> -c <script> <source_path>: passing source_path as argv[0]
     // makes $0 inside the test functions refer to the original script.
     let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
@@ -496,7 +509,7 @@ fn spawn_test(
     Ok(PendingTest {
         child,
         timed_out: false,
-        name: test_name.to_string(),
+        name: display_name.to_string(),
         start,
         context: Some(context),
         source_path: source_path_owned,
@@ -642,7 +655,8 @@ mod tests {
         fs::write(&path, script).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let ctx = TempDir::new().unwrap().keep();
-        let pending = spawn_test(test_name, &tf.functions, &path, ctx, &[], &[]).unwrap();
+        let pending =
+            spawn_test(test_name, test_name, &tf.functions, &path, ctx, &[], &[]).unwrap();
         wait_and_collect(pending)
     }
 
@@ -685,6 +699,7 @@ mod tests {
             source: which::which("true").unwrap(),
         };
         let pending = spawn_test(
+            "test_override",
             "test_override",
             &tf.functions,
             &path,
@@ -751,14 +766,15 @@ mod tests {
             override_cmds: vec![],
             strace: vec![],
             timeout: None,
-            fuzz: false,
+            fuzz: None,
         };
 
-        let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
+        let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
             .tests
             .iter()
             .map(|t| {
                 (
+                    t.name.as_str(),
                     t.name.as_str(),
                     test_file.functions.as_slice(),
                     path.as_path(),
@@ -790,14 +806,15 @@ mod tests {
             override_cmds: vec![],
             strace: vec![],
             timeout: None,
-            fuzz: false,
+            fuzz: None,
         };
 
-        let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
+        let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
             .tests
             .iter()
             .map(|t| {
                 (
+                    t.name.as_str(),
                     t.name.as_str(),
                     test_file.functions.as_slice(),
                     path.as_path(),
@@ -829,14 +846,15 @@ mod tests {
             override_cmds: vec![],
             strace: vec![],
             timeout: None,
-            fuzz: false,
+            fuzz: None,
         };
 
-        let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = test_file
+        let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
             .tests
             .iter()
             .map(|t| {
                 (
+                    t.name.as_str(),
                     t.name.as_str(),
                     test_file.functions.as_slice(),
                     path.as_path(),
@@ -868,13 +886,20 @@ mod tests {
             override_cmds: vec![],
             strace: vec![],
             timeout: Some(std::time::Duration::from_millis(200)),
-            fuzz: false,
+            fuzz: None,
         };
 
-        let test_refs: Vec<(&str, &[FunctionDefinition], &Path)> = tf
+        let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = tf
             .tests
             .iter()
-            .map(|t| (t.name.as_str(), tf.functions.as_slice(), path.as_path()))
+            .map(|t| {
+                (
+                    t.name.as_str(),
+                    t.name.as_str(),
+                    tf.functions.as_slice(),
+                    path.as_path(),
+                )
+            })
             .collect();
 
         let results = run_all_tests(test_refs, &config).unwrap();
