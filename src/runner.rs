@@ -426,6 +426,19 @@ pub fn run_all_tests(
     Ok(results)
 }
 
+/// Resolve a shell name or path to an executable, falling back to `/bin/sh`
+/// when the requested shell is not found.
+fn resolve_shell(shell: &str) -> String {
+    if shell.contains('/') {
+        if std::path::Path::new(shell).exists() {
+            return shell.to_string();
+        }
+    } else if which::which(shell).is_ok() {
+        return shell.to_string();
+    }
+    "/bin/sh".to_string()
+}
+
 /// Spawn a child process that will run the test. Returns a `PendingTest` that
 /// the caller must reap (or simply drop to kill+clean up).
 fn spawn_test(
@@ -477,7 +490,7 @@ fn spawn_test(
     let source_path_owned = source_path
         .canonicalize()
         .unwrap_or_else(|_| source_path.to_path_buf());
-    let shell = crate::discovery::get_script_shell(&source_path_owned);
+    let shell = resolve_shell(&crate::discovery::get_script_shell(&source_path_owned));
 
     #[cfg(feature = "cgroup")]
     let cgroup = crate::cgroup::TestCgroup::try_create(display_name);

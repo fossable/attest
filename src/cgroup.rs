@@ -45,19 +45,17 @@ impl TestCgroup {
             })
             .collect();
         let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir_name = format!("{safe_id}_{count}");
-        let path = base.join(&dir_name);
+        let path = base.join(format!("{safe_id}_{count}"));
 
         if let Err(e) = std::fs::create_dir(&path) {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
-                // Leftover from a previous run – try to reuse after cleanup
                 let _ = std::fs::remove_dir(&path);
                 if let Err(e2) = std::fs::create_dir(&path) {
-                    trace!("Failed to create test cgroup {dir_name}: {e2}");
+                    trace!("failed to create test cgroup: {e2}");
                     return None;
                 }
             } else {
-                trace!("Failed to create test cgroup {dir_name}: {e}");
+                trace!("failed to create test cgroup: {e}");
                 return None;
             }
         }
@@ -104,8 +102,72 @@ impl Drop for TestCgroup {
     }
 }
 
-/// Find the nearest ancestor cgroup where `cgroup.procs` works. Create a new
-/// cgroup there and enable resource controllers.
+fn cgroup_type(path: &Path) -> String {
+    std::fs::read_to_string(path.join("cgroup.type"))
+        .unwrap_or_else(|_| "domain".to_string())
+        .trim()
+        .to_string()
+}
+
+fn is_domain(path: &Path) -> bool {
+    cgroup_type(path) == "domain"
+}
+
+/// Ensure `path` is a usable "domain" cgroup, creating or recovering it as needed.
+/// Returns false if the cgroup cannot be made usable.
+fn ensure_domain_cgroup(path: &Path) -> bool {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !is_domain(path) {
+                debug!(path=%path.display(), "stale cgroup (type='{}'): purging and recreating", cgroup_type(path));
+                purge_cgroup_children(path);
+                let _ = std::fs::remove_dir(path);
+                if let Err(e2) = std::fs::create_dir(path) {
+                    debug!(path=%path.display(), "recreate failed: {e2}");
+                    return false;
+                }
+            }
+        }
+        Err(e) => {
+            debug!(path=%path.display(), "create failed: {e}");
+            return false;
+        }
+    }
+    if !is_domain(path) {
+        debug!(path=%path.display(), "newly created cgroup has unexpected type '{}'", cgroup_type(path));
+        let _ = std::fs::remove_dir(path);
+        return false;
+    }
+    true
+}
+
+/// Remove all empty child cgroup directories under `dir` (best-effort).
+fn purge_cgroup_children(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            purge_cgroup_children(&p);
+            let _ = std::fs::remove_dir(&p);
+        }
+    }
+}
+
+/// Move `ancestor` up one level within `/sys/fs/cgroup`. Returns false when
+/// already at the cgroup root (no useful parent remains).
+fn try_parent(ancestor: &mut PathBuf) -> bool {
+    match ancestor.parent() {
+        Some(p) if p.starts_with("/sys/fs/cgroup") && p != Path::new("/sys/fs/cgroup") => {
+            *ancestor = p.to_path_buf();
+            true
+        }
+        _ => false,
+    }
+}
+
 fn init_base() -> Option<PathBuf> {
     let cg_content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let rel = cg_content
@@ -118,58 +180,96 @@ fn init_base() -> Option<PathBuf> {
     let mut ancestor = PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
 
     loop {
-        let base = ancestor.join("attest");
-
-        // Create base dir; tolerate AlreadyExists from prior runs.
-        match std::fs::create_dir(&base) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => {
-                trace!(path=%base.display(), "Create failed: {e}");
-                match ancestor.parent() {
-                    Some(p) if p != Path::new("/sys/fs/cgroup") => {
-                        ancestor = p.to_path_buf();
-                        continue;
-                    }
-                    _ => break,
-                }
+        // Only "domain" cgroups can parent child cgroups that hold processes.
+        // "domain threaded" and "domain invalid" ancestors yield unusable children.
+        if !is_domain(&ancestor) {
+            debug!(path=%ancestor.display(), "ancestor type is '{}'; skipping", cgroup_type(&ancestor));
+            if !try_parent(&mut ancestor) {
+                break;
             }
+            continue;
         }
 
-        // Probe: create a temporary child cgroup and fork a process that
-        // writes its own PID to cgroup.procs, exiting 0 on success and 1
-        // on EOPNOTSUPP or any other error.
+        let base = ancestor.join("attest");
+        if !ensure_domain_cgroup(&base) {
+            if !try_parent(&mut ancestor) {
+                break;
+            }
+            continue;
+        }
+
+        // cgroup v2 no-internal-process constraint: a non-root cgroup that has
+        // child cgroups cannot directly contain processes. Move the current process
+        // into base/main (a leaf) so that any child we fork also starts in a leaf
+        // and can freely migrate to a sibling test cgroup via cgroup.procs.
+        let main_cgroup = base.join("main");
+        if !ensure_domain_cgroup(&main_cgroup) {
+            let _ = std::fs::remove_dir(&base);
+            if !try_parent(&mut ancestor) {
+                break;
+            }
+            continue;
+        }
+
+        let current_pid = std::process::id().to_string();
+        if let Err(e) = std::fs::write(main_cgroup.join("cgroup.procs"), &current_pid) {
+            if e.raw_os_error() == Some(libc::EOPNOTSUPP) {
+                // The cgroup is in a threaded subtree; cgroup.procs is not valid
+                // anywhere in this hierarchy. No point walking up.
+                debug!(
+                    "cgroup.procs not supported (type: '{}')",
+                    cgroup_type(&main_cgroup)
+                );
+                let _ = std::fs::remove_dir(&main_cgroup);
+                let _ = std::fs::remove_dir(&base);
+                break;
+            }
+            debug!(path=%main_cgroup.display(), "failed to enter main cgroup: {e}");
+            let _ = std::fs::remove_dir(&main_cgroup);
+            let _ = std::fs::remove_dir(&base);
+            if !try_parent(&mut ancestor) {
+                break;
+            }
+            continue;
+        }
+
+        // Probe: fork a child that inherits base/main (a leaf) and verify it can
+        // migrate to a sibling cgroup by writing to its cgroup.procs.
         let probe = base.join("_probe");
         let _ = std::fs::remove_dir(&probe); // clean up from a crashed prior run
-        let probe_ok = if std::fs::create_dir(&probe).is_ok() {
+        let probe_ok = std::fs::create_dir(&probe).is_ok() && {
             let result = probe_cgroup_procs(&probe);
-            let _ = std::fs::remove_dir(&probe); // child exited, cgroup is empty
+            let _ = std::fs::remove_dir(&probe);
             result
-        } else {
-            false
         };
 
         if probe_ok {
+            // Enable only the controllers already delegated to base by its parent
+            // (visible in base/cgroup.controllers). Never write to
+            // ancestor/cgroup.subtree_control — doing so while the ancestor has live
+            // processes transitions it to "domain invalid" state on subsequent runs.
+            let available =
+                std::fs::read_to_string(base.join("cgroup.controllers")).unwrap_or_default();
             for ctrl in ["cpu", "memory", "io", "pids"] {
-                let _ = std::fs::write(ancestor.join("cgroup.subtree_control"), format!("+{ctrl}"));
-                let _ = std::fs::write(base.join("cgroup.subtree_control"), format!("+{ctrl}"));
+                if available.split_whitespace().any(|c| c == ctrl) {
+                    let _ = std::fs::write(base.join("cgroup.subtree_control"), format!("+{ctrl}"));
+                }
             }
-            debug!(path=%base.display(), "Selected cgroup base");
+            debug!(path=%base.display(), "selected cgroup base");
             return Some(base);
         }
 
-        trace!(
-            "cgroup.procs probe failed at {}; trying parent",
-            base.display()
-        );
-        let _ = std::fs::remove_dir(&base); // may fail if non-empty, that's ok
-        match ancestor.parent() {
-            Some(p) if p != Path::new("/sys/fs/cgroup") => ancestor = p.to_path_buf(),
-            _ => break,
+        // Probe failed; restore the current process to the ancestor and walk up.
+        let _ = std::fs::write(ancestor.join("cgroup.procs"), &current_pid);
+        let _ = std::fs::remove_dir(&main_cgroup);
+        let _ = std::fs::remove_dir(&base);
+        debug!(path=%base.display(), "cgroup.procs probe failed; trying parent");
+        if !try_parent(&mut ancestor) {
+            break;
         }
     }
 
-    debug!("No suitable cgroup found in hierarchy");
+    debug!("no suitable cgroup found in hierarchy");
     None
 }
 
@@ -181,12 +281,25 @@ fn probe_cgroup_procs(dir: &Path) -> bool {
         return false;
     }
     if pid == 0 {
-        // Child process.
         let my_pid = std::process::id().to_string();
-        let ok = std::fs::write(dir.join("cgroup.procs"), my_pid).is_ok();
-        unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        match std::fs::write(dir.join("cgroup.procs"), &my_pid) {
+            Ok(()) => unsafe { libc::_exit(0) },
+            Err(e) => {
+                let msg = format!(
+                    "cgroup probe: write to {}/cgroup.procs failed: {e}\n",
+                    dir.display()
+                );
+                unsafe {
+                    libc::write(
+                        2,
+                        msg.as_ptr() as *const libc::c_void,
+                        msg.len() as libc::size_t,
+                    );
+                    libc::_exit(1)
+                }
+            }
+        }
     }
-    // Parent: wait for probe child.
     let mut status = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
     libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
