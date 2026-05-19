@@ -87,6 +87,11 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     repeat: usize,
 
+    /// Override the shell used to run tests, ignoring each script's own shebang
+    /// (e.g. `/bin/bash`, `/usr/bin/zsh`)
+    #[arg(long)]
+    shebang: Option<String>,
+
     /// Enable debug logging
     #[arg(short = 'd', long)]
     debug: bool,
@@ -267,6 +272,7 @@ fn main() -> anyhow::Result<()> {
                 strace: cli.strace,
                 timeout: cli.timeout.map(std::time::Duration::from_secs_f64),
                 fuzz: cli.fuzz,
+                shebang: cli.shebang,
             };
 
             let test_refs: Vec<(

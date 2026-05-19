@@ -197,6 +197,8 @@ pub struct RunConfig {
     /// Randomly SIGSTOP/SIGCONT individual descendant processes of each test to introduce
     /// timing non-determinism.
     pub fuzz: Option<f64>,
+    /// Override the shell used to run test scripts, ignoring the script's own shebang.
+    pub shebang: Option<String>,
 }
 
 pub fn run_all_tests(
@@ -242,6 +244,7 @@ pub fn run_all_tests(
                 contexts_dir.join(display_name),
                 &config.override_cmds,
                 &config.strace,
+                config.shebang.as_deref(),
             )?);
         } else {
             break;
@@ -381,6 +384,7 @@ pub fn run_all_tests(
                     contexts_dir.join(display_name),
                     &config.override_cmds,
                     &config.strace,
+                    config.shebang.as_deref(),
                 )?);
             }
         }
@@ -449,6 +453,7 @@ fn spawn_test(
     context: PathBuf,
     override_cmds: &[OverrideSpec],
     strace: &[String],
+    shebang: Option<&str>,
 ) -> Result<PendingTest> {
     if std::fs::exists(&context)? {
         std::fs::remove_dir_all(&context)?;
@@ -490,7 +495,11 @@ fn spawn_test(
     let source_path_owned = source_path
         .canonicalize()
         .unwrap_or_else(|_| source_path.to_path_buf());
-    let shell = resolve_shell(&crate::discovery::get_script_shell(&source_path_owned));
+    let shell = if let Some(s) = shebang {
+        resolve_shell(s)
+    } else {
+        resolve_shell(&crate::discovery::get_script_shell(&source_path_owned))
+    };
 
     #[cfg(feature = "cgroup")]
     let cgroup = crate::cgroup::TestCgroup::try_create(display_name);
@@ -669,7 +678,7 @@ mod tests {
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let ctx = TempDir::new().unwrap().keep();
         let pending =
-            spawn_test(test_name, test_name, &tf.functions, &path, ctx, &[], &[]).unwrap();
+            spawn_test(test_name, test_name, &tf.functions, &path, ctx, &[], &[], None).unwrap();
         wait_and_collect(pending)
     }
 
@@ -719,6 +728,7 @@ mod tests {
             ctx,
             std::slice::from_ref(&spec),
             &[],
+            None,
         )
         .unwrap();
         let result = wait_and_collect(pending);
@@ -780,6 +790,7 @@ mod tests {
             strace: vec![],
             timeout: None,
             fuzz: None,
+            shebang: None,
         };
 
         let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
@@ -820,6 +831,7 @@ mod tests {
             strace: vec![],
             timeout: None,
             fuzz: None,
+            shebang: None,
         };
 
         let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
@@ -860,6 +872,7 @@ mod tests {
             strace: vec![],
             timeout: None,
             fuzz: None,
+            shebang: None,
         };
 
         let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
@@ -900,6 +913,7 @@ mod tests {
             strace: vec![],
             timeout: Some(std::time::Duration::from_millis(200)),
             fuzz: None,
+            shebang: None,
         };
 
         let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = tf
