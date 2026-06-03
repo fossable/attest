@@ -199,6 +199,8 @@ pub struct RunConfig {
     pub fuzz: Option<f64>,
     /// Override the shell used to run test scripts, ignoring the script's own shebang.
     pub shebang: Option<String>,
+    #[cfg(feature = "cgroup")]
+    pub no_cgroups: bool,
 }
 
 pub fn run_all_tests(
@@ -245,6 +247,8 @@ pub fn run_all_tests(
                 &config.override_cmds,
                 &config.strace,
                 config.shebang.as_deref(),
+                #[cfg(feature = "cgroup")]
+                config.no_cgroups,
             )?);
         } else {
             break;
@@ -337,7 +341,7 @@ pub fn run_all_tests(
         }
 
         // Process reaped tests in reverse index order so removal doesn't shift indices.
-        reaped.sort_by(|a, b| b.0.cmp(&a.0));
+        reaped.sort_by_key(|b| std::cmp::Reverse(b.0));
         let mut completed: Vec<TestResult> = Vec::new();
         for (i, exit_status) in reaped {
             if let Some(ref mut xt) = xtrace {
@@ -385,6 +389,8 @@ pub fn run_all_tests(
                     &config.override_cmds,
                     &config.strace,
                     config.shebang.as_deref(),
+                    #[cfg(feature = "cgroup")]
+                    config.no_cgroups,
                 )?);
             }
         }
@@ -445,6 +451,7 @@ fn resolve_shell(shell: &str) -> String {
 
 /// Spawn a child process that will run the test. Returns a `PendingTest` that
 /// the caller must reap (or simply drop to kill+clean up).
+#[allow(clippy::too_many_arguments)]
 fn spawn_test(
     display_name: &str,
     fn_name: &str,
@@ -454,6 +461,7 @@ fn spawn_test(
     override_cmds: &[OverrideSpec],
     strace: &[String],
     shebang: Option<&str>,
+    #[cfg(feature = "cgroup")] no_cgroups: bool,
 ) -> Result<PendingTest> {
     if std::fs::exists(&context)? {
         std::fs::remove_dir_all(&context)?;
@@ -502,7 +510,11 @@ fn spawn_test(
     };
 
     #[cfg(feature = "cgroup")]
-    let cgroup = crate::cgroup::TestCgroup::try_create(display_name);
+    let cgroup = if no_cgroups {
+        None
+    } else {
+        crate::cgroup::TestCgroup::try_create(display_name)
+    };
 
     let runner_content = build_runner_script(fn_name, &script_path, &context, strace);
     // <shell> -c <script> <source_path>: passing source_path as argv[0]
@@ -678,7 +690,7 @@ mod tests {
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let ctx = TempDir::new().unwrap().keep();
         let pending =
-            spawn_test(test_name, test_name, &tf.functions, &path, ctx, &[], &[], None).unwrap();
+            spawn_test(test_name, test_name, &tf.functions, &path, ctx, &[], &[], None, #[cfg(feature = "cgroup")] false).unwrap();
         wait_and_collect(pending)
     }
 
@@ -729,6 +741,8 @@ mod tests {
             std::slice::from_ref(&spec),
             &[],
             None,
+            #[cfg(feature = "cgroup")]
+            false,
         )
         .unwrap();
         let result = wait_and_collect(pending);
@@ -791,6 +805,8 @@ mod tests {
             timeout: None,
             fuzz: None,
             shebang: None,
+            #[cfg(feature = "cgroup")]
+            no_cgroups: false,
         };
 
         let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
@@ -832,6 +848,8 @@ mod tests {
             timeout: None,
             fuzz: None,
             shebang: None,
+            #[cfg(feature = "cgroup")]
+            no_cgroups: false,
         };
 
         let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
@@ -873,6 +891,8 @@ mod tests {
             timeout: None,
             fuzz: None,
             shebang: None,
+            #[cfg(feature = "cgroup")]
+            no_cgroups: false,
         };
 
         let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
@@ -914,6 +934,8 @@ mod tests {
             timeout: Some(std::time::Duration::from_millis(200)),
             fuzz: None,
             shebang: None,
+            #[cfg(feature = "cgroup")]
+            no_cgroups: false,
         };
 
         let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = tf

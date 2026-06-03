@@ -92,6 +92,11 @@ struct Cli {
     #[arg(long)]
     shebang: Option<String>,
 
+    /// Disable cgroup resource tracking
+    #[cfg(feature = "cgroup")]
+    #[arg(long)]
+    no_cgroups: bool,
+
     /// Enable debug logging
     #[arg(short = 'd', long)]
     debug: bool,
@@ -273,6 +278,8 @@ fn main() -> anyhow::Result<()> {
                 timeout: cli.timeout.map(std::time::Duration::from_secs_f64),
                 fuzz: cli.fuzz,
                 shebang: cli.shebang,
+                #[cfg(feature = "cgroup")]
+                no_cgroups: cli.no_cgroups,
             };
 
             let test_refs: Vec<(

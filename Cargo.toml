@@ -4,7 +4,7 @@ description = "Dead simple test framework for the age of AI"
 edition = "2024"
 license = "Unlicense"
 name = "attest"
-version = "0.5.2"
+version = "0.5.3"
 
 [features]
 default = ["cgroup"]
