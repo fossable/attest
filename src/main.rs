@@ -65,6 +65,11 @@ struct Cli {
     #[arg(long)]
     r#override: Vec<runner::OverrideSpec>,
 
+    /// Add a directory of executables to each test's PATH (lower precedence than
+    /// --override, higher than the inherited PATH). Can be specified multiple times.
+    #[arg(long)]
+    bin_dir: Vec<PathBuf>,
+
     /// Trace a command with strace, saving output to the test context dir (can be specified multiple times)
     #[arg(long)]
     strace: Vec<String>,
@@ -274,6 +279,7 @@ fn main() -> anyhow::Result<()> {
                 json: cli.json,
                 save_context: cli.save_context,
                 override_cmds: cli.r#override,
+                bin_dirs: cli.bin_dir,
                 strace: cli.strace,
                 timeout: cli.timeout.map(std::time::Duration::from_secs_f64),
                 fuzz: cli.fuzz,

@@ -191,6 +191,9 @@ pub struct RunConfig {
     /// When unset, context dirs are temporary and cleaned up automatically.
     pub save_context: Option<PathBuf>,
     pub override_cmds: Vec<OverrideSpec>,
+    /// Directories prepended to each test's PATH (e.g. build-cache output dirs).
+    /// Lower precedence than `override_cmds`/context `bin/`, higher than inherited PATH.
+    pub bin_dirs: Vec<PathBuf>,
     pub strace: Vec<String>,
     /// Wall-clock timeout per test. Tests exceeding this are killed and marked as timed out.
     pub timeout: Option<Duration>,
@@ -245,6 +248,7 @@ pub fn run_all_tests(
                 source_path,
                 contexts_dir.join(display_name),
                 &config.override_cmds,
+                &config.bin_dirs,
                 &config.strace,
                 config.shebang.as_deref(),
                 #[cfg(feature = "cgroup")]
@@ -387,6 +391,7 @@ pub fn run_all_tests(
                     source_path,
                     contexts_dir.join(display_name),
                     &config.override_cmds,
+                    &config.bin_dirs,
                     &config.strace,
                     config.shebang.as_deref(),
                     #[cfg(feature = "cgroup")]
@@ -459,6 +464,7 @@ fn spawn_test(
     source_path: &Path,
     context: PathBuf,
     override_cmds: &[OverrideSpec],
+    bin_dirs: &[PathBuf],
     strace: &[String],
     shebang: Option<&str>,
     #[cfg(feature = "cgroup")] no_cgroups: bool,
@@ -516,7 +522,7 @@ fn spawn_test(
         crate::cgroup::TestCgroup::try_create(display_name)
     };
 
-    let runner_content = build_runner_script(fn_name, &script_path, &context, strace);
+    let runner_content = build_runner_script(fn_name, &script_path, &context, bin_dirs, strace);
     // <shell> -c <script> <source_path>: passing source_path as argv[0]
     // makes $0 inside the test functions refer to the original script.
     let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
@@ -584,11 +590,18 @@ fn build_runner_script(
     test_name: &str,
     functions_path: &Path,
     working_dir: &Path,
+    bin_dirs: &[PathBuf],
     strace: &[String],
 ) -> String {
     let mut s = String::new();
 
-    // bin/ is always first so --override binaries take precedence.
+    // Extra bin dirs (e.g. build-cache output dirs) go first so they sit below the
+    // context bin/ (--override wins) but above the inherited PATH.
+    for dir in bin_dirs {
+        s.push_str(&format!("export PATH={}:$PATH\n", dir.display()));
+    }
+
+    // bin/ is next so --override binaries take precedence over --bin-dir.
     let bin_dir = working_dir.join("bin");
     s.push_str(&format!("export PATH={}:$PATH\n", bin_dir.display()));
 
@@ -690,7 +703,7 @@ mod tests {
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let ctx = TempDir::new().unwrap().keep();
         let pending =
-            spawn_test(test_name, test_name, &tf.functions, &path, ctx, &[], &[], None, #[cfg(feature = "cgroup")] false).unwrap();
+            spawn_test(test_name, test_name, &tf.functions, &path, ctx, &[], &[], &[], None, #[cfg(feature = "cgroup")] false).unwrap();
         wait_and_collect(pending)
     }
 
@@ -740,6 +753,7 @@ mod tests {
             ctx,
             std::slice::from_ref(&spec),
             &[],
+            &[],
             None,
             #[cfg(feature = "cgroup")]
             false,
@@ -749,6 +763,45 @@ mod tests {
         assert!(result.passed);
         // bin/true should exist in the context dir
         assert!(result.context.join("bin/true").exists());
+    }
+
+    #[test]
+    fn execute_test_with_bin_dir() {
+        // A directory passed via --bin-dir is prepended to PATH, so a bare-name
+        // call to an executable living there resolves (no copy into the context).
+        let bin = TempDir::new().unwrap();
+        let tool = bin.path().join("mytool");
+        fs::write(&tool, "#!/bin/sh\necho mytool_ran\n").unwrap();
+        fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("t.sh");
+        fs::write(
+            &path,
+            "test_bin_dir() {\n  out=$(mytool)\n  test \"$out\" = \"mytool_ran\"\n}\n",
+        )
+        .unwrap();
+        let tf = crate::parser::parse_test_file(&path).unwrap();
+        let ctx = TempDir::new().unwrap().keep();
+        let bin_dirs = vec![bin.path().to_path_buf()];
+        let pending = spawn_test(
+            "test_bin_dir",
+            "test_bin_dir",
+            &tf.functions,
+            &path,
+            ctx,
+            &[],
+            &bin_dirs,
+            &[],
+            None,
+            #[cfg(feature = "cgroup")]
+            false,
+        )
+        .unwrap();
+        let result = wait_and_collect(pending);
+        assert!(result.passed);
+        // The tool is referenced in place, not copied into the context bin/.
+        assert!(!result.context.join("bin/mytool").exists());
     }
 
     #[test]
@@ -801,6 +854,7 @@ mod tests {
             json: false,
             save_context: None,
             override_cmds: vec![],
+            bin_dirs: vec![],
             strace: vec![],
             timeout: None,
             fuzz: None,
@@ -844,6 +898,7 @@ mod tests {
             json: false,
             save_context: None,
             override_cmds: vec![],
+            bin_dirs: vec![],
             strace: vec![],
             timeout: None,
             fuzz: None,
@@ -887,6 +942,7 @@ mod tests {
             json: false,
             save_context: None,
             override_cmds: vec![],
+            bin_dirs: vec![],
             strace: vec![],
             timeout: None,
             fuzz: None,
@@ -930,6 +986,7 @@ mod tests {
             json: false,
             save_context: None,
             override_cmds: vec![],
+            bin_dirs: vec![],
             strace: vec![],
             timeout: Some(std::time::Duration::from_millis(200)),
             fuzz: None,
