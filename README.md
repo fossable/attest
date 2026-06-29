@@ -52,7 +52,8 @@ tests:
 
 - All test functions are named starting with `test`
 - If any command in your function exits nonzero, the whole test fails
-- Each test runs in a separate temporary directory
+- Each test runs in its own overlay of the working directory: it sees the real
+  project files, but everything it writes is isolated and discarded after the run
 
 ### Inline tests
 
@@ -358,7 +359,7 @@ aggressive the fuzzer is by passing a higher number to `--fuzz`.
 
 ![](./.github/assets/diagnostic.gif)
 
-When a test fails, you can obtain the context directory:
+When a test fails, you can save its context:
 
 ```sh
 attest . --save-context ./results

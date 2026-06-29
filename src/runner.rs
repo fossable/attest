@@ -7,9 +7,10 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::output;
+use crate::overlay;
 
 /// Tracks live xtrace streaming state: which test holds the output lock and how
 /// far we've read into its xtrace.log.
@@ -202,6 +203,8 @@ pub struct RunConfig {
     pub fuzz: Option<f64>,
     /// Override the shell used to run test scripts, ignoring the script's own shebang.
     pub shebang: Option<String>,
+    /// Disable overlayfs isolation; run each test directly in the working directory.
+    pub no_overlay: bool,
     #[cfg(feature = "cgroup")]
     pub no_cgroups: bool,
 }
@@ -231,12 +234,29 @@ pub fn run_all_tests(
 
     let tmp = tempfile::TempDir::new()?;
 
-    let contexts_dir = if let Some(ref save_dir) = config.save_context {
-        std::fs::create_dir_all(save_dir)?;
-        save_dir
+    // Lower (read-only) layer of every test's overlay: attest's invocation dir,
+    // so tests see the real project files while their writes stay isolated.
+    let lower = std::env::current_dir()?;
+    let overlay_mode = if config.no_overlay {
+        None
     } else {
-        tmp.path()
+        overlay::probe_support(tmp.path())
     };
+    match overlay_mode {
+        None if config.no_overlay => debug!("overlay isolation disabled via --no-overlay"),
+        None => warn!("overlayfs unavailable; tests run without filesystem isolation"),
+        Some(overlay::Mode::Userns) => {
+            debug!("using unprivileged overlay; tests run as root inside their namespace")
+        }
+        Some(overlay::Mode::Privileged) => debug!("using privileged overlay isolation"),
+    }
+
+    // Contexts always live in the temp dir; `--save-context` copies each test's
+    // upper layer and logs out afterward (see save_test_context).
+    let contexts_dir = tmp.path();
+    if let Some(ref save_dir) = config.save_context {
+        std::fs::create_dir_all(save_dir)?;
+    }
 
     // Seed the initial batch up to max_parallel.
     while pending_list.len() < max_parallel {
@@ -253,6 +273,8 @@ pub fn run_all_tests(
                 config.shebang.as_deref(),
                 #[cfg(feature = "cgroup")]
                 config.no_cgroups,
+                &lower,
+                overlay_mode,
             )?);
         } else {
             break;
@@ -364,6 +386,9 @@ pub fn run_all_tests(
                 continue; // Drop kills + cleans up
             }
             let result = build_result(pending, exit_status);
+            if let Some(ref save_dir) = config.save_context {
+                save_test_context(&result, save_dir);
+            }
             completed.push(result);
         }
 
@@ -396,6 +421,8 @@ pub fn run_all_tests(
                     config.shebang.as_deref(),
                     #[cfg(feature = "cgroup")]
                     config.no_cgroups,
+                    &lower,
+                    overlay_mode,
                 )?);
             }
         }
@@ -468,12 +495,28 @@ fn spawn_test(
     strace: &[String],
     shebang: Option<&str>,
     #[cfg(feature = "cgroup")] no_cgroups: bool,
+    lower: &Path,
+    overlay_mode: Option<overlay::Mode>,
 ) -> Result<PendingTest> {
     if std::fs::exists(&context)? {
         std::fs::remove_dir_all(&context)?;
     }
 
     std::fs::create_dir_all(&context)?;
+
+    // When overlay isolation is available, create the upper/work/merged dirs the
+    // child will mount an overlay onto (lower = invocation dir, see register_mount).
+    let overlay_dirs = if overlay_mode.is_some() {
+        let upper = context.join("upper");
+        let work = context.join("work");
+        let merged = context.join("merged");
+        std::fs::create_dir_all(&upper)?;
+        std::fs::create_dir_all(&work)?;
+        std::fs::create_dir_all(&merged)?;
+        Some((upper, work, merged))
+    } else {
+        None
+    };
 
     let script_path = context.join("functions.sh");
     let mut script = String::new();
@@ -543,6 +586,12 @@ fn spawn_test(
         }
     }
 
+    // Registered after the cgroup hook so cgroup placement happens in the host
+    // namespace before we unshare into a private mount namespace.
+    if let (Some(mode), Some((upper, work, merged))) = (overlay_mode, &overlay_dirs) {
+        overlay::register_mount(&mut cmd, mode, lower, upper, work, merged);
+    }
+
     let start = Instant::now();
     let child = cmd.spawn().map_err(|e| anyhow!("spawn failed: {e}"))?;
 
@@ -581,6 +630,28 @@ fn build_result(mut pending: PendingTest, status: ExitStatus) -> TestResult {
     }
     // pending drops here: reaped=true skips kill/wait, tmp_dir=None skips
     // dir removal, cgroup drops removing the cgroup directory.
+}
+
+/// Copy a finished test's overlay upper layer (the files it created/modified)
+/// plus its logs into `<save_dir>/<test name>` for `--save-context`. The temp
+/// context dir is otherwise discarded when the run's tempdir is dropped.
+fn save_test_context(result: &TestResult, save_dir: &Path) {
+    let dst = save_dir.join(&result.name);
+    let upper = result.context.join("upper");
+    if upper.is_dir() {
+        if let Err(e) = overlay::copy_dir_recursive(&upper, &dst) {
+            warn!("failed to save context for {}: {e}", result.name);
+        }
+    } else if let Err(e) = std::fs::create_dir_all(&dst) {
+        warn!("failed to save context for {}: {e}", result.name);
+        return;
+    }
+    for log in ["stdout.log", "xtrace.log"] {
+        let src = result.context.join(log);
+        if src.exists() {
+            let _ = std::fs::copy(&src, dst.join(log));
+        }
+    }
 }
 
 /// Build the shell script content that sources the function definitions and
@@ -702,8 +773,22 @@ mod tests {
         fs::write(&path, script).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let ctx = TempDir::new().unwrap().keep();
-        let pending =
-            spawn_test(test_name, test_name, &tf.functions, &path, ctx, &[], &[], &[], None, #[cfg(feature = "cgroup")] false).unwrap();
+        let pending = spawn_test(
+            test_name,
+            test_name,
+            &tf.functions,
+            &path,
+            ctx,
+            &[],
+            &[],
+            &[],
+            None,
+            #[cfg(feature = "cgroup")]
+            false,
+            tmp.path(),
+            None,
+        )
+        .unwrap();
         wait_and_collect(pending)
     }
 
@@ -757,6 +842,8 @@ mod tests {
             None,
             #[cfg(feature = "cgroup")]
             false,
+            tmp.path(),
+            None,
         )
         .unwrap();
         let result = wait_and_collect(pending);
@@ -796,12 +883,58 @@ mod tests {
             None,
             #[cfg(feature = "cgroup")]
             false,
+            tmp.path(),
+            None,
         )
         .unwrap();
         let result = wait_and_collect(pending);
         assert!(result.passed);
         // The tool is referenced in place, not copied into the context bin/.
         assert!(!result.context.join("bin/mytool").exists());
+    }
+
+    #[test]
+    fn overlay_isolates_writes() {
+        // Requires an overlay-capable scratch fs (privileged or user namespace);
+        // skip otherwise. Probe against the same dir that will host the upper layer.
+        let lower = TempDir::new().unwrap();
+        let Some(mode) = overlay::probe_support(lower.path()) else {
+            return;
+        };
+
+        // Lower layer seeded with a file the test should be able to read.
+        fs::write(lower.path().join("seed.txt"), "seed").unwrap();
+
+        let srcdir = TempDir::new().unwrap();
+        let path = srcdir.path().join("t.sh");
+        fs::write(
+            &path,
+            "test_o() {\n  cat seed.txt\n  echo made > new.txt\n}\n",
+        )
+        .unwrap();
+        let tf = crate::parser::parse_test_file(&path).unwrap();
+        let ctx = TempDir::new().unwrap().keep();
+        let pending = spawn_test(
+            "test_o",
+            "test_o",
+            &tf.functions,
+            &path,
+            ctx,
+            &[],
+            &[],
+            &[],
+            None,
+            #[cfg(feature = "cgroup")]
+            false,
+            lower.path(),
+            Some(mode),
+        )
+        .unwrap();
+        let result = wait_and_collect(pending);
+        assert!(result.passed);
+        // The write landed in the upper layer, not the real lower dir.
+        assert!(result.context.join("upper/new.txt").exists());
+        assert!(!lower.path().join("new.txt").exists());
     }
 
     #[test]
@@ -859,6 +992,7 @@ mod tests {
             timeout: None,
             fuzz: None,
             shebang: None,
+            no_overlay: false,
             #[cfg(feature = "cgroup")]
             no_cgroups: false,
         };
@@ -903,6 +1037,7 @@ mod tests {
             timeout: None,
             fuzz: None,
             shebang: None,
+            no_overlay: false,
             #[cfg(feature = "cgroup")]
             no_cgroups: false,
         };
@@ -947,6 +1082,7 @@ mod tests {
             timeout: None,
             fuzz: None,
             shebang: None,
+            no_overlay: false,
             #[cfg(feature = "cgroup")]
             no_cgroups: false,
         };
@@ -991,6 +1127,7 @@ mod tests {
             timeout: Some(std::time::Duration::from_millis(200)),
             fuzz: None,
             shebang: None,
+            no_overlay: false,
             #[cfg(feature = "cgroup")]
             no_cgroups: false,
         };

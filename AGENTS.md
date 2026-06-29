@@ -11,9 +11,20 @@
 - `src/runner.rs` - For each test: writes all extracted functions (test +
   helper) to a temp script, forks a child that execs `/bin/sh -c`, redirects
   stdout to `stdout.log` and stderr to `xtrace.log`, enables `set -ex`, sources
-  the script, then invokes the test function by name. Parallel by default via
-  `fork(2)` with configurable parallelism (`--parallel`). Supports `--timeout`,
-  `--bail`, `--override`, `--bin-dir`, and `--strace`.
+  the script, then invokes the test function by name. The child runs with its
+  working directory set to a per-test overlay mount (see `src/overlay.rs`) when
+  available. Parallel by default via `fork(2)` with configurable parallelism
+  (`--parallel`). Supports `--timeout`, `--bail`, `--override`, `--bin-dir`, and
+  `--strace`. With `--save-context`, copies each test's overlay upper layer plus
+  logs to the output dir.
+- `src/overlay.rs` - Per-test overlayfs isolation. Probes once (in `run_all_tests`)
+  whether overlays can be mounted: with `CAP_SYS_ADMIN` (`Mode::Privileged`,
+  unshare a mount namespace) or, failing that, inside a user namespace
+  (`Mode::Userns`, also maps the caller to uid 0 so the test runs as root in its
+  namespace). The mount happens in the forked child's private mount namespace via
+  `pre_exec` (lower = invocation dir, upper/work/merged under the per-test context
+  dir), so it is torn down automatically on exit and never pollutes the host. If
+  no mode works, the runner warns once and runs without isolation.
 - `src/diagnostics.rs` - On failure, parses `xtrace.log` to find the last
   executed command, maps it back to the original source file, and renders an
   annotate-snippets error snippet. Also shows inline character-level diffs for
@@ -52,7 +63,10 @@ implicit assertion - if it exits nonzero, the test fails. Non-test functions
 - `--strace CMD` — wrap CMD with strace, output saved to `strace/CMD.log` in the
   test context dir
 - `--xtrace` — stream xtrace output live (one test at a time)
-- `--save-context DIR` — save test context to DIR for debugging
+- `--save-context DIR` — for each test, copy its overlay upper layer (files it
+  created/modified) plus `stdout.log`/`xtrace.log` to `DIR/<test>/` for debugging
+- `--no-overlay` — disable overlayfs isolation; run each test directly in the
+  working directory (same as the automatic fallback when overlays are unavailable)
 
 ## Building and running
 
