@@ -6,11 +6,21 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
 use crate::output;
 use crate::overlay;
+
+/// Set by the SIGINT/SIGTERM handler. Tests run in their own sessions (see the
+/// `setsid` hook in `spawn_test`), so the terminal no longer delivers ^C to
+/// them directly; the poll loop watches this flag and tears the run down.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn mark_interrupted(_: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
 
 /// Tracks live xtrace streaming state: which test holds the output lock and how
 /// far we've read into its xtrace.log.
@@ -126,10 +136,24 @@ struct PendingTest {
     cgroup: Option<crate::cgroup::TestCgroup>,
 }
 
+impl PendingTest {
+    /// Kill the test's entire process tree: the child was made a session (and
+    /// process-group) leader at spawn, so its pgid is its pid. The cgroup, when
+    /// present, also catches processes that re-`setsid`'d themselves.
+    fn kill_tree(&mut self) {
+        #[cfg(feature = "cgroup")]
+        if let Some(ref cg) = self.cgroup {
+            cg.kill_all();
+        }
+        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+        let _ = self.child.kill();
+    }
+}
+
 impl Drop for PendingTest {
     fn drop(&mut self) {
         if let Ok(None) = self.child.try_wait() {
-            let _ = self.child.kill();
+            self.kill_tree();
             let _ = self.child.wait();
         }
         if let Some(ref dir) = self.context {
@@ -183,6 +207,7 @@ impl std::str::FromStr for OverrideSpec {
     }
 }
 
+#[derive(Default)]
 pub struct RunConfig {
     pub parallel: usize,
     pub bail: bool,
@@ -207,6 +232,16 @@ pub struct RunConfig {
     pub no_overlay: bool,
     #[cfg(feature = "cgroup")]
     pub no_cgroups: bool,
+}
+
+/// Run-wide isolation state shared by every spawned test.
+struct RunEnv {
+    /// Directory attest was invoked from; each test starts here (inside its
+    /// ephemeral root when isolation is active).
+    invocation_dir: PathBuf,
+    overlay_mode: Option<overlay::Mode>,
+    /// How each mount under `/` is re-established inside per-test roots.
+    submounts: Vec<overlay::Submount>,
 }
 
 pub fn run_all_tests(
@@ -234,13 +269,24 @@ pub fn run_all_tests(
 
     let tmp = tempfile::TempDir::new()?;
 
-    // Lower (read-only) layer of every test's overlay: attest's invocation dir,
-    // so tests see the real project files while their writes stay isolated.
-    let lower = std::env::current_dir()?;
+    // Tests run in their own sessions (setsid in spawn_test), so the terminal
+    // no longer delivers ^C to them; catch it here and tear the run down.
+    unsafe {
+        let handler = mark_interrupted as extern "C" fn(libc::c_int) as usize;
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
+
+    // Each test runs in a whole-root overlay: `/` is the read-only lower layer
+    // and writes land in per-test upper layers. The submount plan (which mounts
+    // get their own ephemeral overlay, which are rebound live) is computed once
+    // and shared across tests; the probe rehearses the full setup with it.
+    let invocation_dir = std::env::current_dir()?;
+    let submounts = overlay::compute_submounts(&invocation_dir);
     let overlay_mode = if config.no_overlay {
         None
     } else {
-        overlay::probe_support(tmp.path())
+        overlay::probe_support(tmp.path(), &invocation_dir, &submounts)
     };
     match overlay_mode {
         None if config.no_overlay => debug!("overlay isolation disabled via --no-overlay"),
@@ -250,6 +296,11 @@ pub fn run_all_tests(
         }
         Some(overlay::Mode::Privileged) => debug!("using privileged overlay isolation"),
     }
+    let env = RunEnv {
+        invocation_dir,
+        overlay_mode,
+        submounts,
+    };
 
     // Contexts always live in the temp dir; `--save-context` copies each test's
     // upper layer and logs out afterward (see save_test_context).
@@ -267,14 +318,8 @@ pub fn run_all_tests(
                 all_functions,
                 source_path,
                 contexts_dir.join(display_name),
-                &config.override_cmds,
-                &config.bin_dirs,
-                &config.strace,
-                config.shebang.as_deref(),
-                #[cfg(feature = "cgroup")]
-                config.no_cgroups,
-                &lower,
-                overlay_mode,
+                config,
+                &env,
             )?);
         } else {
             break;
@@ -290,6 +335,14 @@ pub fn run_all_tests(
 
     // Poll loop: non-blocking reap, process completions, update status.
     while !pending_list.is_empty() {
+        // A SIGINT/SIGTERM arrived: kill every test tree and abort the run.
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            let n = pending_list.len();
+            pending_list.clear(); // drop kills the trees and removes contexts
+            status.finish();
+            anyhow::bail!("interrupted; killed {n} running test(s)");
+        }
+
         // Stream xtrace output from the current holder.
         if let Some(ref mut xt) = xtrace
             && xt.has_new()
@@ -301,7 +354,7 @@ pub fn run_all_tests(
         if let Some(timeout) = config.timeout {
             for pending in pending_list.iter_mut() {
                 if !pending.timed_out && pending.start.elapsed() > timeout {
-                    let _ = pending.child.kill();
+                    pending.kill_tree();
                     pending.timed_out = true;
                 }
             }
@@ -387,7 +440,7 @@ pub fn run_all_tests(
             }
             let result = build_result(pending, exit_status);
             if let Some(ref save_dir) = config.save_context {
-                save_test_context(&result, save_dir);
+                save_test_context(&result, save_dir, &env.submounts);
             }
             completed.push(result);
         }
@@ -415,14 +468,8 @@ pub fn run_all_tests(
                     all_functions,
                     source_path,
                     contexts_dir.join(display_name),
-                    &config.override_cmds,
-                    &config.bin_dirs,
-                    &config.strace,
-                    config.shebang.as_deref(),
-                    #[cfg(feature = "cgroup")]
-                    config.no_cgroups,
-                    &lower,
-                    overlay_mode,
+                    config,
+                    &env,
                 )?);
             }
         }
@@ -482,40 +529,29 @@ fn resolve_shell(shell: &str) -> String {
 }
 
 /// Spawn a child process that will run the test. Returns a `PendingTest` that
-/// the caller must reap (or simply drop to kill+clean up).
-#[allow(clippy::too_many_arguments)]
+/// the caller must reap (or simply drop to kill+clean up). `context` must be
+/// unique per test (the caller derives it from the unique display name).
 fn spawn_test(
     display_name: &str,
     fn_name: &str,
     all_functions: &[FunctionDefinition],
     source_path: &Path,
     context: PathBuf,
-    override_cmds: &[OverrideSpec],
-    bin_dirs: &[PathBuf],
-    strace: &[String],
-    shebang: Option<&str>,
-    #[cfg(feature = "cgroup")] no_cgroups: bool,
-    lower: &Path,
-    overlay_mode: Option<overlay::Mode>,
+    config: &RunConfig,
+    env: &RunEnv,
 ) -> Result<PendingTest> {
-    if std::fs::exists(&context)? {
-        std::fs::remove_dir_all(&context)?;
-    }
-
     std::fs::create_dir_all(&context)?;
 
-    // When overlay isolation is available, create the upper/work/merged dirs the
-    // child will mount an overlay onto (lower = invocation dir, see register_mount).
-    let overlay_dirs = if overlay_mode.is_some() {
-        let upper = context.join("upper");
-        let work = context.join("work");
-        let merged = context.join("merged");
-        std::fs::create_dir_all(&upper)?;
-        std::fs::create_dir_all(&work)?;
-        std::fs::create_dir_all(&merged)?;
-        Some((upper, work, merged))
-    } else {
-        None
+    // When overlay isolation is available, plan the per-test ephemeral root
+    // (this also creates the overlay dirs under the context dir).
+    let root_plan = match env.overlay_mode {
+        Some(mode) => Some(overlay::RootOverlay::build(
+            mode,
+            &context,
+            &env.invocation_dir,
+            &env.submounts,
+        )?),
+        None => None,
     };
 
     let script_path = context.join("functions.sh");
@@ -526,11 +562,11 @@ fn spawn_test(
     }
     std::fs::write(&script_path, &script)?;
 
-    if !override_cmds.is_empty() {
+    if !config.override_cmds.is_empty() {
         let bin: &Path = &context.join("bin");
         std::fs::create_dir_all(bin)?;
 
-        for spec in override_cmds {
+        for spec in &config.override_cmds {
             let src = &spec.source;
             if !src.exists() {
                 return Err(anyhow!(
@@ -545,42 +581,54 @@ fn spawn_test(
         }
     }
 
-    if !strace.is_empty() {
-        create_strace_wrappers(&context, strace)?;
+    if !config.strace.is_empty() {
+        create_strace_wrappers(&context, &config.strace)?;
     }
 
     let source_path_owned = source_path
         .canonicalize()
         .unwrap_or_else(|_| source_path.to_path_buf());
-    let shell = if let Some(s) = shebang {
+    let shell = if let Some(s) = config.shebang.as_deref() {
         resolve_shell(s)
     } else {
         resolve_shell(&crate::discovery::get_script_shell(&source_path_owned))
     };
 
     #[cfg(feature = "cgroup")]
-    let cgroup = if no_cgroups {
+    let cgroup = if config.no_cgroups {
         None
     } else {
         crate::cgroup::TestCgroup::try_create(display_name)
     };
 
-    let runner_content = build_runner_script(fn_name, &script_path, &context, bin_dirs, strace);
+    let runner_content =
+        build_runner_script(fn_name, &script_path, &context, &config.bin_dirs, &config.strace);
     // <shell> -c <script> <source_path>: passing source_path as argv[0]
     // makes $0 inside the test functions refer to the original script.
     let source_str = source_path_owned.to_str().unwrap_or("bash").to_string();
     let mut cmd = Command::new(&shell);
     cmd.args(["-c", &runner_content, &source_str]);
 
-    // Place the child into its cgroup after fork, before exec.
+    // Detach into a fresh session/process group so timeouts and cleanup can
+    // kill the whole test tree with one kill(-pgid).
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    // Place the child into its cgroup after fork, before exec. The parent has
+    // live threads (status-bar ticker), so the hook must not allocate:
+    // add_self_to is async-signal-safe and the path CString is built here.
     // TODO don't include test setup in cgroup
     #[cfg(feature = "cgroup")]
-    if let Some(ref cg) = cgroup {
-        let procs_path = cg.procs_path();
+    if let Some(ref cg) = cgroup
+        && let Some(procs) = cg.procs_cstring()
+    {
         unsafe {
             cmd.pre_exec(move || {
-                let pid = std::process::id().to_string();
-                let _ = std::fs::write(&procs_path, pid);
+                crate::cgroup::add_self_to(&procs);
                 Ok(())
             });
         }
@@ -588,12 +636,22 @@ fn spawn_test(
 
     // Registered after the cgroup hook so cgroup placement happens in the host
     // namespace before we unshare into a private mount namespace.
-    if let (Some(mode), Some((upper, work, merged))) = (overlay_mode, &overlay_dirs) {
-        overlay::register_mount(&mut cmd, mode, lower, upper, work, merged);
+    let isolated = root_plan.is_some();
+    if let Some(plan) = root_plan {
+        overlay::register_root_mount(&mut cmd, plan);
     }
 
     let start = Instant::now();
-    let child = cmd.spawn().map_err(|e| anyhow!("spawn failed: {e}"))?;
+    let child = cmd.spawn().map_err(|e| {
+        if isolated {
+            anyhow!(
+                "spawn failed for {display_name}: {e} \
+                 (isolation was active for this test; --no-overlay disables it)"
+            )
+        } else {
+            anyhow!("spawn failed for {display_name}: {e}")
+        }
+    })?;
 
     Ok(PendingTest {
         child,
@@ -632,12 +690,19 @@ fn build_result(mut pending: PendingTest, status: ExitStatus) -> TestResult {
     // dir removal, cgroup drops removing the cgroup directory.
 }
 
-/// Copy a finished test's overlay upper layer (the files it created/modified)
-/// plus its logs into `<save_dir>/<test name>` for `--save-context`. The temp
-/// context dir is otherwise discarded when the run's tempdir is dropped.
-fn save_test_context(result: &TestResult, save_dir: &Path) {
+/// Does `dir` exist and contain at least one entry?
+fn dir_non_empty(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// Copy the files a finished test created or modified (the upper layers of its
+/// root overlay and of each ephemeral submount overlay, merged and laid out by
+/// absolute path — a write to `/tmp/x` lands at `<dst>/tmp/x`) plus its logs
+/// into `<save_dir>/<test name>` for `--save-context`. The temp context dir is
+/// otherwise discarded when the run's tempdir is dropped.
+fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay::Submount]) {
     let dst = save_dir.join(&result.name);
-    let upper = result.context.join("upper");
+    let upper = overlay::upper_dir(&result.context);
     if upper.is_dir() {
         if let Err(e) = overlay::copy_dir_recursive(&upper, &dst) {
             warn!("failed to save context for {}: {e}", result.name);
@@ -646,12 +711,32 @@ fn save_test_context(result: &TestResult, save_dir: &Path) {
         warn!("failed to save context for {}: {e}", result.name);
         return;
     }
+    for (i, sm) in submounts.iter().filter(|s| s.ephemeral).enumerate() {
+        let sub_upper = overlay::submount_upper_dir(&result.context, i);
+        if !dir_non_empty(&sub_upper) {
+            continue;
+        }
+        let rel = sm.source.strip_prefix("/").unwrap_or(&sm.source);
+        if let Err(e) = overlay::copy_dir_recursive(&sub_upper, &dst.join(rel)) {
+            warn!(
+                "failed to save {} delta for {}: {e}",
+                sm.source.display(),
+                result.name
+            );
+        }
+    }
     for log in ["stdout.log", "xtrace.log"] {
         let src = result.context.join(log);
         if src.exists() {
             let _ = std::fs::copy(&src, dst.join(log));
         }
     }
+}
+
+/// Quote a path for literal inclusion in generated sh scripts: single-quoted,
+/// with embedded single quotes escaped, so spaces and metacharacters survive.
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
 /// Build the shell script content that sources the function definitions and
@@ -669,17 +754,17 @@ fn build_runner_script(
     // Extra bin dirs (e.g. build-cache output dirs) go first so they sit below the
     // context bin/ (--override wins) but above the inherited PATH.
     for dir in bin_dirs {
-        s.push_str(&format!("export PATH={}:$PATH\n", dir.display()));
+        s.push_str(&format!("export PATH={}:\"$PATH\"\n", sh_quote(dir)));
     }
 
     // bin/ is next so --override binaries take precedence over --bin-dir.
     let bin_dir = working_dir.join("bin");
-    s.push_str(&format!("export PATH={}:$PATH\n", bin_dir.display()));
+    s.push_str(&format!("export PATH={}:\"$PATH\"\n", sh_quote(&bin_dir)));
 
     // Strace wrappers dir must precede bin/ so wrappers intercept calls.
     if !strace.is_empty() {
         let strace_bin = working_dir.join("strace_bin");
-        s.push_str(&format!("export PATH={}:$PATH\n", strace_bin.display()));
+        s.push_str(&format!("export PATH={}:\"$PATH\"\n", sh_quote(&strace_bin)));
     }
 
     // Redirect both stdout and stderr to log files, then enable xtrace.
@@ -687,13 +772,13 @@ fn build_runner_script(
     let xtrace = working_dir.join("xtrace.log");
     s.push_str(&format!(
         "exec 1>{} 2>{}\n",
-        stdout.display(),
-        xtrace.display()
+        sh_quote(&stdout),
+        sh_quote(&xtrace)
     ));
     s.push_str("set -e\n");
 
     // Source function definitions, then enable xtrace and invoke the test function.
-    s.push_str(&format!(". {}\n", functions_path.display()));
+    s.push_str(&format!(". {}\n", sh_quote(functions_path)));
     s.push_str("PS4='+$LINENO: '\n");
     s.push_str("set -x\n");
     s.push_str(test_name);
@@ -744,8 +829,8 @@ fn create_strace_wrappers(working_dir: &Path, commands: &[String]) -> Result<()>
         let strace_out = strace_dir.join(format!("{cmd}.log"));
         let script = format!(
             "#!/bin/sh\nexec strace -f -o {} {} \"$@\"\n",
-            strace_out.display(),
-            real_path.display(),
+            sh_quote(&strace_out),
+            sh_quote(&real_path),
         );
         std::fs::write(&wrapper, script)?;
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
@@ -766,6 +851,15 @@ mod tests {
         build_result(pending, status)
     }
 
+    /// A RunEnv with isolation disabled, for direct spawn_test tests.
+    fn no_overlay_env(invocation_dir: &Path) -> RunEnv {
+        RunEnv {
+            invocation_dir: invocation_dir.to_path_buf(),
+            overlay_mode: None,
+            submounts: Vec::new(),
+        }
+    }
+
     /// Parse `script` content and run `test_name` via spawn_test + wait_and_collect.
     fn run_inline(script: &str, test_name: &str) -> TestResult {
         let tmp = TempDir::new().unwrap();
@@ -779,14 +873,8 @@ mod tests {
             &tf.functions,
             &path,
             ctx,
-            &[],
-            &[],
-            &[],
-            None,
-            #[cfg(feature = "cgroup")]
-            false,
-            tmp.path(),
-            None,
+            &RunConfig::default(),
+            &no_overlay_env(tmp.path()),
         )
         .unwrap();
         wait_and_collect(pending)
@@ -830,20 +918,18 @@ mod tests {
             name: "true".into(),
             source: which::which("true").unwrap(),
         };
+        let config = RunConfig {
+            override_cmds: vec![spec],
+            ..RunConfig::default()
+        };
         let pending = spawn_test(
             "test_override",
             "test_override",
             &tf.functions,
             &path,
             ctx,
-            std::slice::from_ref(&spec),
-            &[],
-            &[],
-            None,
-            #[cfg(feature = "cgroup")]
-            false,
-            tmp.path(),
-            None,
+            &config,
+            &no_overlay_env(tmp.path()),
         )
         .unwrap();
         let result = wait_and_collect(pending);
@@ -870,21 +956,18 @@ mod tests {
         .unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let ctx = TempDir::new().unwrap().keep();
-        let bin_dirs = vec![bin.path().to_path_buf()];
+        let config = RunConfig {
+            bin_dirs: vec![bin.path().to_path_buf()],
+            ..RunConfig::default()
+        };
         let pending = spawn_test(
             "test_bin_dir",
             "test_bin_dir",
             &tf.functions,
             &path,
             ctx,
-            &[],
-            &bin_dirs,
-            &[],
-            None,
-            #[cfg(feature = "cgroup")]
-            false,
-            tmp.path(),
-            None,
+            &config,
+            &no_overlay_env(tmp.path()),
         )
         .unwrap();
         let result = wait_and_collect(pending);
@@ -893,48 +976,87 @@ mod tests {
         assert!(!result.context.join("bin/mytool").exists());
     }
 
-    #[test]
-    fn overlay_isolates_writes() {
-        // Requires an overlay-capable scratch fs (privileged or user namespace);
-        // skip otherwise. Probe against the same dir that will host the upper layer.
-        let lower = TempDir::new().unwrap();
-        let Some(mode) = overlay::probe_support(lower.path()) else {
-            return;
-        };
+    /// A RunEnv with real isolation, or `None` when this environment cannot
+    /// mount overlays (the test should then be skipped).
+    fn overlay_env(scratch: &Path, invocation_dir: &Path) -> Option<RunEnv> {
+        let submounts = overlay::compute_submounts(invocation_dir);
+        let mode = overlay::probe_support(scratch, invocation_dir, &submounts)?;
+        Some(RunEnv {
+            invocation_dir: invocation_dir.to_path_buf(),
+            overlay_mode: Some(mode),
+            submounts,
+        })
+    }
 
-        // Lower layer seeded with a file the test should be able to read.
-        fs::write(lower.path().join("seed.txt"), "seed").unwrap();
-
+    /// Run one test function with full isolation; skip (None) when unsupported.
+    fn run_isolated(script: &str, test_name: &str) -> Option<TestResult> {
+        let tmp = TempDir::new().unwrap();
         let srcdir = TempDir::new().unwrap();
+        let env = overlay_env(tmp.path(), srcdir.path())?;
         let path = srcdir.path().join("t.sh");
-        fs::write(
-            &path,
-            "test_o() {\n  cat seed.txt\n  echo made > new.txt\n}\n",
-        )
-        .unwrap();
+        fs::write(&path, script).unwrap();
         let tf = crate::parser::parse_test_file(&path).unwrap();
         let ctx = TempDir::new().unwrap().keep();
         let pending = spawn_test(
-            "test_o",
-            "test_o",
+            test_name,
+            test_name,
             &tf.functions,
             &path,
             ctx,
-            &[],
-            &[],
-            &[],
-            None,
-            #[cfg(feature = "cgroup")]
-            false,
-            lower.path(),
-            Some(mode),
+            &RunConfig::default(),
+            &env,
         )
         .unwrap();
-        let result = wait_and_collect(pending);
+        Some(wait_and_collect(pending))
+    }
+
+    #[test]
+    fn overlay_isolates_root_writes() {
+        // The test sees the real root (reads /usr) but its write to a system path
+        // must land in the ephemeral upper layer, not on the host filesystem.
+        let Some(result) = run_isolated(
+            "test_o() {\n  test -d /usr\n  echo made > /attest_root_marker.txt\n}\n",
+            "test_o",
+        ) else {
+            return; // overlays unavailable here
+        };
         assert!(result.passed);
-        // The write landed in the upper layer, not the real lower dir.
-        assert!(result.context.join("upper/new.txt").exists());
-        assert!(!lower.path().join("new.txt").exists());
+        assert!(
+            overlay::upper_dir(&result.context)
+                .join("attest_root_marker.txt")
+                .exists()
+        );
+        assert!(!Path::new("/attest_root_marker.txt").exists());
+    }
+
+    #[test]
+    fn overlay_isolates_tmp_writes() {
+        // Writes to /tmp must not reach the host: they land in the root upper
+        // layer (when /tmp is part of the root fs) or in the upper of /tmp's
+        // own ephemeral overlay (when /tmp is a separate mount).
+        let marker = "attest_unit_tmp_marker";
+        let _ = fs::remove_file(Path::new("/tmp").join(marker));
+        let Some(result) = run_isolated(
+            &format!("test_t() {{\n  echo made > /tmp/{marker}\n}}\n"),
+            "test_t",
+        ) else {
+            return; // overlays unavailable here
+        };
+        assert!(result.passed);
+        assert!(!Path::new("/tmp").join(marker).exists());
+
+        let mut uppers = vec![overlay::upper_dir(&result.context).join("tmp")];
+        for i in 0.. {
+            let dir = overlay::submount_upper_dir(&result.context, i);
+            if !dir.exists() {
+                break;
+            }
+            uppers.push(dir);
+        }
+        assert!(
+            uppers.iter().any(|u| u.join(marker).exists()),
+            "marker not found in any upper layer"
+        );
     }
 
     #[test]
@@ -982,19 +1104,7 @@ mod tests {
 
         let config = RunConfig {
             parallel: 1,
-            bail: false,
-            xtrace: false,
-            json: false,
-            save_context: None,
-            override_cmds: vec![],
-            bin_dirs: vec![],
-            strace: vec![],
-            timeout: None,
-            fuzz: None,
-            shebang: None,
-            no_overlay: false,
-            #[cfg(feature = "cgroup")]
-            no_cgroups: false,
+            ..RunConfig::default()
         };
 
         let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
@@ -1028,18 +1138,7 @@ mod tests {
         let config = RunConfig {
             parallel: 1,
             bail: true,
-            xtrace: false,
-            json: false,
-            save_context: None,
-            override_cmds: vec![],
-            bin_dirs: vec![],
-            strace: vec![],
-            timeout: None,
-            fuzz: None,
-            shebang: None,
-            no_overlay: false,
-            #[cfg(feature = "cgroup")]
-            no_cgroups: false,
+            ..RunConfig::default()
         };
 
         let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
@@ -1072,19 +1171,7 @@ mod tests {
 
         let config = RunConfig {
             parallel: 0,
-            bail: false,
-            xtrace: false,
-            json: false,
-            save_context: None,
-            override_cmds: vec![],
-            bin_dirs: vec![],
-            strace: vec![],
-            timeout: None,
-            fuzz: None,
-            shebang: None,
-            no_overlay: false,
-            #[cfg(feature = "cgroup")]
-            no_cgroups: false,
+            ..RunConfig::default()
         };
 
         let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = test_file
@@ -1117,19 +1204,8 @@ mod tests {
 
         let config = RunConfig {
             parallel: 1,
-            bail: false,
-            xtrace: false,
-            json: false,
-            save_context: None,
-            override_cmds: vec![],
-            bin_dirs: vec![],
-            strace: vec![],
             timeout: Some(std::time::Duration::from_millis(200)),
-            fuzz: None,
-            shebang: None,
-            no_overlay: false,
-            #[cfg(feature = "cgroup")]
-            no_cgroups: false,
+            ..RunConfig::default()
         };
 
         let test_refs: Vec<(&str, &str, &[FunctionDefinition], &Path)> = tf

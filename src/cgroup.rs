@@ -1,3 +1,5 @@
+use std::ffi::{CStr, CString};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,10 +65,17 @@ impl TestCgroup {
         Some(Self { path })
     }
 
-    /// Path of the `cgroup.procs` file the child writes its pid into to join
-    /// this cgroup. Used from `Command::pre_exec` after fork, before exec.
-    pub fn procs_path(&self) -> PathBuf {
-        self.path.join("cgroup.procs")
+    /// The `cgroup.procs` path as a `CString`, ready for [`add_self_to`] in a
+    /// `Command::pre_exec` hook (after fork, before exec).
+    pub fn procs_cstring(&self) -> Option<CString> {
+        CString::new(self.path.join("cgroup.procs").into_os_string().into_vec()).ok()
+    }
+
+    /// Kill every process in the cgroup by writing to `cgroup.kill`
+    /// (Linux 5.14+). Best-effort: catches processes that escaped the test's
+    /// process group (e.g. daemonized with their own setsid).
+    pub fn kill_all(&self) {
+        let _ = std::fs::write(self.path.join("cgroup.kill"), "1");
     }
 
     /// Read total CPU time (user + system) from the cgroup. Returns `None`
@@ -273,32 +282,48 @@ fn init_base() -> Option<PathBuf> {
     None
 }
 
+/// Write the calling process's pid into `procs` (a `cgroup.procs` file).
+/// Async-signal-safe with no allocation, so it is usable between `fork` and
+/// `exec` even though other threads (e.g. the status-bar ticker) exist in the
+/// parent. Returns whether the write succeeded.
+pub(crate) unsafe fn add_self_to(procs: &CStr) -> bool {
+    unsafe {
+        let mut buf = [0u8; 12];
+        let mut n = buf.len();
+        let mut v = libc::getpid() as u64;
+        loop {
+            n -= 1;
+            buf[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return false;
+        }
+        let len = buf.len() - n;
+        let written = libc::write(fd, buf[n..].as_ptr().cast(), len);
+        libc::close(fd);
+        written == len as isize
+    }
+}
+
 /// Fork a child that writes its own PID to `dir/cgroup.procs` and exits 0 on
-/// success or 1 on failure. Returns true if the child exited with 0.
+/// success or 1 on failure. Returns true if the child exited with 0. The
+/// forked child uses only the async-signal-safe [`add_self_to`].
 fn probe_cgroup_procs(dir: &Path) -> bool {
+    let Ok(procs) = CString::new(dir.join("cgroup.procs").into_os_string().into_vec()) else {
+        return false;
+    };
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return false;
     }
     if pid == 0 {
-        let my_pid = std::process::id().to_string();
-        match std::fs::write(dir.join("cgroup.procs"), &my_pid) {
-            Ok(()) => unsafe { libc::_exit(0) },
-            Err(e) => {
-                let msg = format!(
-                    "cgroup probe: write to {}/cgroup.procs failed: {e}\n",
-                    dir.display()
-                );
-                unsafe {
-                    libc::write(
-                        2,
-                        msg.as_ptr() as *const libc::c_void,
-                        msg.len() as libc::size_t,
-                    );
-                    libc::_exit(1)
-                }
-            }
-        }
+        let ok = unsafe { add_self_to(&procs) };
+        unsafe { libc::_exit(i32::from(!ok)) }
     }
     let mut status = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };

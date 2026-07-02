@@ -67,7 +67,8 @@ struct Cli {
     r#override: Vec<runner::OverrideSpec>,
 
     /// Add a directory of executables to each test's PATH (lower precedence than
-    /// --override, higher than the inherited PATH). Can be specified multiple times.
+    /// --override, higher than the inherited PATH). Relative paths are resolved
+    /// against the current directory at invocation time. Can be specified multiple times.
     #[arg(long)]
     bin_dir: Vec<PathBuf>,
 
@@ -90,8 +91,8 @@ struct Cli {
     fuzz: Option<f64>,
 
     /// Run each test this many times (default: 1)
-    #[arg(long, default_value_t = 1)]
-    repeat: usize,
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+    repeat: u64,
 
     /// Override the shell used to run tests, ignoring each script's own shebang
     /// (e.g. `/bin/bash`, `/usr/bin/zsh`)
@@ -127,6 +128,36 @@ enum Commands {
     },
     /// Print AI agent skill for writing .test files
     Skill,
+}
+
+/// Unique display name for a test. A name that appears in more than one
+/// selected file is qualified with its file name (`a.test:test_foo`) so
+/// results are tellable-apart and per-test context directories, which are
+/// keyed by display name, never collide; a numeric suffix breaks any
+/// remaining tie (same name defined twice in one file).
+fn display_base(
+    name: &str,
+    file: &Path,
+    duplicated: bool,
+    taken: &mut std::collections::HashSet<String>,
+) -> String {
+    let base = if duplicated {
+        let file_name = file.file_name().map(|f| f.to_string_lossy()).unwrap_or_default();
+        format!("{file_name}:{name}")
+    } else {
+        name.to_string()
+    };
+    if taken.insert(base.clone()) {
+        return base;
+    }
+    let mut k = 2;
+    loop {
+        let candidate = format!("{base}:{k}");
+        if taken.insert(candidate.clone()) {
+            return candidate;
+        }
+        k += 1;
+    }
 }
 
 /// Split a positional argument into a file path and an optional test filter.
@@ -246,36 +277,68 @@ fn main() -> anyhow::Result<()> {
             let filter = cli.filter.or(inline_filter);
             let pattern = filter.as_deref().map(parser::TestPattern::parse);
             let files = discovery::discover_test_files(&path)?;
-            let mut all_tests: Vec<(
-                String,
+
+            // Collect matching tests, tallying how often each name occurs so
+            // duplicates across files can be given distinct display names.
+            let mut selected: Vec<(
                 String,
                 Vec<brush_parser::ast::FunctionDefinition>,
                 std::path::PathBuf,
             )> = Vec::new();
+            let mut name_counts: std::collections::HashMap<String, usize> = Default::default();
             for file in &files {
                 let test_file = parser::parse_test_file(file)?;
-                let functions = test_file.functions;
                 for test in test_file.tests {
                     if let Some(ref p) = pattern
                         && !p.matches(&test)
                     {
                         continue;
                     }
-                    for i in 1..=cli.repeat {
-                        let display = if cli.repeat > 1 {
-                            format!("{}#{}", test.name, i)
-                        } else {
-                            test.name.clone()
-                        };
-                        all_tests.push((
-                            display,
-                            test.name.clone(),
-                            functions.clone(),
-                            file.clone(),
-                        ));
-                    }
+                    *name_counts.entry(test.name.clone()).or_default() += 1;
+                    selected.push((test.name, test_file.functions.clone(), file.clone()));
                 }
             }
+            if selected.is_empty() {
+                match &filter {
+                    Some(f) => anyhow::bail!("no tests match filter '{f}'"),
+                    None => anyhow::bail!("no test functions found in {}", path.display()),
+                }
+            }
+
+            // Display names key result output, per-test context dirs, and
+            // --save-context dirs, so they must be unique per test.
+            let mut taken = std::collections::HashSet::new();
+            let mut all_tests: Vec<(
+                String,
+                String,
+                Vec<brush_parser::ast::FunctionDefinition>,
+                std::path::PathBuf,
+            )> = Vec::new();
+            for (name, functions, file) in selected {
+                let base = display_base(&name, &file, name_counts[&name] > 1, &mut taken);
+                for i in 1..=cli.repeat {
+                    let display = if cli.repeat > 1 {
+                        format!("{base}#{i}")
+                    } else {
+                        base.clone()
+                    };
+                    all_tests.push((display, name.clone(), functions.clone(), file.clone()));
+                }
+            }
+
+            // Make --bin-dir entries absolute up front. They are embedded
+            // literally into each test's PATH, which must stay valid after a
+            // test cd's somewhere else — a relative entry would silently stop
+            // resolving. Erroring here (rather than silently) surfaces a clear
+            // message, consistent with how --override validates its source.
+            let bin_dirs = cli
+                .bin_dir
+                .into_iter()
+                .map(|dir| {
+                    dir.canonicalize()
+                        .map_err(|e| anyhow::anyhow!("--bin-dir: {} ({e})", dir.display()))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
 
             let config = runner::RunConfig {
                 parallel: cli.parallel,
@@ -284,7 +347,7 @@ fn main() -> anyhow::Result<()> {
                 json: cli.json,
                 save_context: cli.save_context,
                 override_cmds: cli.r#override,
-                bin_dirs: cli.bin_dir,
+                bin_dirs,
                 strace: cli.strace,
                 timeout: cli.timeout.map(std::time::Duration::from_secs_f64),
                 fuzz: cli.fuzz,
@@ -320,4 +383,51 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn display_base_unqualified_when_unique() {
+        let mut taken = HashSet::new();
+        assert_eq!(
+            display_base("test_a", Path::new("x.test"), false, &mut taken),
+            "test_a"
+        );
+    }
+
+    #[test]
+    fn display_base_qualifies_duplicates_with_file_name() {
+        let mut taken = HashSet::new();
+        assert_eq!(
+            display_base("test_dup", Path::new("dir/a.test"), true, &mut taken),
+            "a.test:test_dup"
+        );
+        assert_eq!(
+            display_base("test_dup", Path::new("dir/b.test"), true, &mut taken),
+            "b.test:test_dup"
+        );
+    }
+
+    #[test]
+    fn display_base_breaks_remaining_ties_numerically() {
+        let mut taken = HashSet::new();
+        assert_eq!(
+            display_base("test_dup", Path::new("a/x.test"), true, &mut taken),
+            "x.test:test_dup"
+        );
+        // Same file name in a different directory collides on the qualified
+        // form; the numeric suffix disambiguates.
+        assert_eq!(
+            display_base("test_dup", Path::new("b/x.test"), true, &mut taken),
+            "x.test:test_dup:2"
+        );
+        assert_eq!(
+            display_base("test_dup", Path::new("c/x.test"), true, &mut taken),
+            "x.test:test_dup:3"
+        );
+    }
 }

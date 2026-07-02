@@ -11,20 +11,32 @@
 - `src/runner.rs` - For each test: writes all extracted functions (test +
   helper) to a temp script, forks a child that execs `/bin/sh -c`, redirects
   stdout to `stdout.log` and stderr to `xtrace.log`, enables `set -ex`, sources
-  the script, then invokes the test function by name. The child runs with its
-  working directory set to a per-test overlay mount (see `src/overlay.rs`) when
-  available. Parallel by default via `fork(2)` with configurable parallelism
-  (`--parallel`). Supports `--timeout`, `--bail`, `--override`, `--bin-dir`, and
-  `--strace`. With `--save-context`, copies each test's overlay upper layer plus
-  logs to the output dir.
-- `src/overlay.rs` - Per-test overlayfs isolation. Probes once (in `run_all_tests`)
-  whether overlays can be mounted: with `CAP_SYS_ADMIN` (`Mode::Privileged`,
-  unshare a mount namespace) or, failing that, inside a user namespace
-  (`Mode::Userns`, also maps the caller to uid 0 so the test runs as root in its
-  namespace). The mount happens in the forked child's private mount namespace via
-  `pre_exec` (lower = invocation dir, upper/work/merged under the per-test context
-  dir), so it is torn down automatically on exit and never pollutes the host. If
-  no mode works, the runner warns once and runs without isolation.
+  the script, then invokes the test function by name. The child pivots into a
+  per-test ephemeral root (see `src/overlay.rs`) when available, runs in its own
+  session (so timeouts and ^C kill the whole process tree via its process group
+  and, when cgroups are active, `cgroup.kill`). Parallel by default via
+  `fork(2)` with configurable parallelism (`--parallel`). Supports `--timeout`,
+  `--bail`, `--override`, `--bin-dir`, and `--strace`. With `--save-context`,
+  copies each test's filesystem delta plus logs to the output dir. Display
+  names (and thus context dirs) are unique per test: a test name defined in
+  more than one file is qualified as `file.test:test_name`.
+- `src/overlay.rs` - Per-test whole-root overlayfs isolation. Each test pivots
+  into a private copy-on-write view of `/`: writes land in per-test upper
+  layers and are discarded on exit. The project mount (the one holding the
+  invocation dir) and the scratch mounts `/tmp`/`/var/tmp` get their own
+  ephemeral overlays; every other mount (`/proc`, `/dev`, `/sys`, file binds
+  like `/etc/resolv.conf`, …) is recursively bind-mounted through live and so
+  stays shared with the host — writes there persist. Overlays need
+  `CAP_SYS_ADMIN`: either directly (`Mode::Privileged`, unshare a mount
+  namespace) or via a user namespace (`Mode::Userns`, which also maps the
+  caller to uid 0 so the test sees itself as root in its namespace). A private
+  UTS namespace keeps hostname changes inside the test.
+  `probe_support` rehearses the full setup (same options, same `pivot_root`)
+  once per run in a throwaway child; if no mode works, the runner warns once
+  and runs without isolation, while a per-test setup failure after a successful
+  probe fails the run loudly rather than silently running unisolated. All
+  mounts happen in the forked child's private mount namespace via `pre_exec`,
+  so they are torn down automatically on exit and never pollute the host.
 - `src/diagnostics.rs` - On failure, parses `xtrace.log` to find the last
   executed command, maps it back to the original source file, and renders an
   annotate-snippets error snippet. Also shows inline character-level diffs for
@@ -63,8 +75,10 @@ implicit assertion - if it exits nonzero, the test fails. Non-test functions
 - `--strace CMD` — wrap CMD with strace, output saved to `strace/CMD.log` in the
   test context dir
 - `--xtrace` — stream xtrace output live (one test at a time)
-- `--save-context DIR` — for each test, copy its overlay upper layer (files it
-  created/modified) plus `stdout.log`/`xtrace.log` to `DIR/<test>/` for debugging
+- `--save-context DIR` — for each test, copy the files it created/modified
+  (all overlay upper layers merged, laid out by absolute path: a write to
+  `/tmp/x` appears at `DIR/<test>/tmp/x`) plus `stdout.log`/`xtrace.log` to
+  `DIR/<test>/` for debugging
 - `--no-overlay` — disable overlayfs isolation; run each test directly in the
   working directory (same as the automatic fallback when overlays are unavailable)
 

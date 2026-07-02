@@ -88,8 +88,11 @@ pub fn print_test_result_json(result: &TestResult) {
         "fail"
     };
 
+    // Lossy so a log containing invalid UTF-8 (e.g. binary output) is still
+    // reported rather than silently becoming empty.
     let read_log = |name: &str| -> String {
-        std::fs::read_to_string(result.context.join(name)).unwrap_or_default()
+        String::from_utf8_lossy(&std::fs::read(result.context.join(name)).unwrap_or_default())
+            .into_owned()
     };
 
     let stdout = json_escape(&read_log("stdout.log"));

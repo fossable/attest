@@ -17,7 +17,11 @@ methods. Do NOT use syntax from other test frameworks (no `assert_eq`, no
 - Test functions MUST be prefixed with `test` (e.g., `testFoo`, `testVersion`)
 - Every command in a test function is an implicit assertion: if it exits
   nonzero, the test fails immediately (`set -e` semantics)
-- Each test runs in its own temporary directory (`$PWD` is a fresh tmpdir)
+- Each test runs in its own copy-on-write view of the filesystem: `$PWD` is
+  the directory attest was invoked from, and writes to the root filesystem,
+  the project tree, and `/tmp` are discarded when the test ends. Tests must
+  not depend on each other's files. Writes to other mounts (`/proc`, `/dev`,
+  network mounts, …) reach the real system and persist
 
 ## Helper functions
 

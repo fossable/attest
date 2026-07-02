@@ -52,8 +52,11 @@ tests:
 
 - All test functions are named starting with `test`
 - If any command in your function exits nonzero, the whole test fails
-- Each test runs in its own overlay of the working directory: it sees the real
-  project files, but everything it writes is isolated and discarded after the run
+- Each test runs in its own copy-on-write view of the filesystem: it starts in
+  the real working directory and sees the real project files, but writes to the
+  root filesystem, the project tree, and `/tmp` are discarded after the run.
+  (Other mounts — `/proc`, `/dev`, network mounts, etc. — stay shared with the
+  host, so writes there persist. `--no-overlay` disables isolation entirely.)
 
 ### Inline tests
 
@@ -365,8 +368,9 @@ When a test fails, you can save its context:
 attest . --save-context ./results
 ```
 
-This directory contains everything: the test's xtrace, stdout, any files created
-by the tests, etc.
+This directory contains, per test, its xtrace and stdout logs plus every file
+the test created or modified, laid out by absolute path (a write to `/tmp/x`
+shows up at `results/<test>/tmp/x`).
 
 You can also just view the xtrace output with the `--xtrace` flag:
 
