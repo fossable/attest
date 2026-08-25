@@ -53,50 +53,43 @@ fn is_shell_script(path: &Path) -> bool {
         return true;
     }
 
-    has_shell_shebang(path).unwrap_or(false)
+    read_first_line(path).is_some_and(|line| is_shell_interpreter(&line))
 }
 
-fn has_shell_shebang(path: &Path) -> std::io::Result<bool> {
-    let mut file = std::fs::File::open(path)?;
+/// Reads the first line of a file (up to 256 bytes). Returns `None` if the file
+/// cannot be opened or read.
+fn read_first_line(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
     let mut buf = [0u8; 256];
-    let n = file.read(&mut buf)?;
+    let n = file.read(&mut buf).ok()?;
     let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
-    let first_line = head.lines().next().unwrap_or("");
-    Ok(first_line.starts_with("#!") && is_shell_interpreter(first_line))
+    Some(head.lines().next().unwrap_or("").to_string())
+}
+
+/// Extracts the interpreter token from a shebang line, handling the
+/// `#!/usr/bin/env bash` form. Returns `None` when the line is not a shebang.
+fn shebang_interpreter(line: &str) -> Option<&str> {
+    let mut parts = line.strip_prefix("#!")?.split_whitespace();
+    let first = parts.next()?;
+    if first.ends_with("/env") {
+        parts.next()
+    } else {
+        Some(first)
+    }
 }
 
 /// Returns the shell interpreter to use for a script file. Reads the shebang
 /// line and extracts the interpreter; falls back to "bash" if absent or unrecognized.
 pub(crate) fn get_script_shell(path: &Path) -> String {
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return "bash".to_string();
-    };
-    let mut buf = [0u8; 256];
-    let Ok(n) = file.read(&mut buf) else {
-        return "bash".to_string();
-    };
-    let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
-    let first_line = head.lines().next().unwrap_or("");
-    if !first_line.starts_with("#!") || !is_shell_interpreter(first_line) {
-        return "bash".to_string();
-    }
-    let shebang = first_line.trim_start_matches("#!");
-    let parts: Vec<&str> = shebang.split_whitespace().collect();
-    if parts.first().is_some_and(|p| p.ends_with("/env")) {
-        parts.get(1).copied().unwrap_or("bash").to_string()
-    } else {
-        parts.first().copied().unwrap_or("bash").to_string()
-    }
+    read_first_line(path)
+        .filter(|line| is_shell_interpreter(line))
+        .and_then(|line| shebang_interpreter(&line).map(str::to_string))
+        .unwrap_or_else(|| "bash".to_string())
 }
 
 pub(crate) fn is_shell_interpreter(shebang: &str) -> bool {
-    let shebang = shebang.trim_start_matches("#!");
-    // Handle "#!/usr/bin/env bash" style
-    let parts: Vec<&str> = shebang.split_whitespace().collect();
-    let interpreter = if parts.first().is_some_and(|p| p.ends_with("/env")) {
-        parts.get(1).copied().unwrap_or("")
-    } else {
-        parts.first().copied().unwrap_or("")
+    let Some(interpreter) = shebang_interpreter(shebang) else {
+        return false;
     };
     let basename = interpreter.rsplit('/').next().unwrap_or(interpreter);
     matches!(basename, "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh")

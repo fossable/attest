@@ -85,3 +85,8 @@ implicit assertion - if it exits nonzero, the test fails. Non-test functions
 ## Building and running
 
 Use `cargo run --` to execute the project.
+
+## TODOs
+
+- Improve non-json terminal output
+  - Render a progressbar that turns a block either green or red instead of "PASS"/"FAIL"

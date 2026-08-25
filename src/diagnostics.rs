@@ -128,11 +128,11 @@ fn find_line_in_source(source: &str, function_name: &str, needle: &str) -> Optio
                     .take(line_idx)
                     .map(|l| l.len() + 1) // +1 for newline
                     .sum::<usize>();
-                let line_content = source.lines().nth(line_idx).unwrap();
-                // Find the trimmed content within the line
-                let indent = line_content.len() - line_content.trim_start().len();
+                // Find the trimmed content within the line (`line` is the
+                // current iteration's slice, identical to `lines().nth(line_idx)`).
+                let indent = line.len() - line.trim_start().len();
                 let span_start = byte_start + indent;
-                let span_end = byte_start + line_content.len();
+                let span_end = byte_start + line.len();
 
                 // Find the function end by continuing to scan
                 let mut func_end_line = line_idx;
