@@ -734,10 +734,10 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
     // The per-test working directory is live-bound inside isolated roots (it
     // is not part of any overlay upper layer), so copy it explicitly.
     let cwd = cwd_dir(&result.context);
-    if dir_non_empty(&cwd) {
-        if let Err(e) = overlay::copy_dir_recursive(&cwd, &dst.join("cwd")) {
-            warn!("failed to save cwd for {}: {e}", result.name);
-        }
+    if dir_non_empty(&cwd)
+        && let Err(e) = overlay::copy_dir_recursive(&cwd, &dst.join("cwd"))
+    {
+        warn!("failed to save cwd for {}: {e}", result.name);
     }
     for log in ["stdout.log", "xtrace.log"] {
         let src = result.context.join(log);
