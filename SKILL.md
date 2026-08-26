@@ -17,11 +17,15 @@ methods. Do NOT use syntax from other test frameworks (no `assert_eq`, no
 - Test functions MUST be prefixed with `test` (e.g., `testFoo`, `testVersion`)
 - Every command in a test function is an implicit assertion: if it exits
   nonzero, the test fails immediately (`set -e` semantics)
-- Each test runs in its own copy-on-write view of the filesystem: `$PWD` is
-  the directory attest was invoked from, and writes to the root filesystem,
-  the project tree, and `/tmp` are discarded when the test ends. Tests must
-  not depend on each other's files. Writes to other mounts (`/proc`, `/dev`,
-  network mounts, …) reach the real system and persist
+- Each test starts in its own clean, empty temporary working directory, so
+  create scratch files right in `$PWD` — never use `mktemp`
+- Each test runs in its own copy-on-write view of the filesystem: writes to
+  the root filesystem, the project tree, and `/tmp` are discarded when the
+  test ends. Tests must not depend on each other's files. Writes to other
+  mounts (`/proc`, `/dev`, network mounts, …) reach the real system and
+  persist
+- Any processes still running when a test ends (background servers, daemons,
+  …) are killed automatically — never write `trap` cleanup for them
 
 ## Helper functions
 
@@ -86,12 +90,13 @@ might_fail || true
 
 ## Setup and cleanup
 
-Use `trap` for cleanup that must run even if the test fails:
+No cleanup is needed for background processes or scratch files: attest kills
+everything the test spawned when it ends, and the test's working directory and
+filesystem writes are discarded automatically.
 
 ```sh
-testWithCleanup() {
+testWithBackgroundServer() {
 	background_server &
-	trap "kill $!" EXIT
 
 	# ... test logic ...
 }

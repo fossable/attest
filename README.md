@@ -52,11 +52,13 @@ tests:
 
 - All test functions are named starting with `test`
 - If any command in your function exits nonzero, the whole test fails
-- Each test runs in its own copy-on-write view of the filesystem: it starts in
-  the real working directory and sees the real project files, but writes to the
-  root filesystem, the project tree, and `/tmp` are discarded after the run.
-  (Other mounts — `/proc`, `/dev`, network mounts, etc. — stay shared with the
-  host, so writes there persist. `--no-overlay` disables isolation entirely.)
+- Each test starts in its own clean, empty temporary working directory, and
+  runs in its own copy-on-write view of the filesystem: it sees the real
+  project files, but writes to the root filesystem, the project tree, and
+  `/tmp` are discarded after the run. (Other mounts — `/proc`, `/dev`, network
+  mounts, etc. — stay shared with the host, so writes there persist.
+  `--no-overlay` disables isolation entirely.) Any processes still running
+  when a test ends are killed automatically.
 
 ### Inline tests
 

@@ -105,6 +105,15 @@ impl TestCgroup {
 
 impl Drop for TestCgroup {
     fn drop(&mut self) {
+        // kill_all is asynchronous: members of the cgroup may still be dying
+        // when we get here, and a cgroup directory cannot be removed while it
+        // has members. Retry briefly before giving up.
+        for _ in 0..50 {
+            if std::fs::remove_dir(&self.path).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         if let Err(e) = std::fs::remove_dir(&self.path) {
             warn!("failed to remove test cgroup {:?}: {e}", self.path);
         }

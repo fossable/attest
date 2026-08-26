@@ -477,7 +477,8 @@ unsafe fn setup_root(p: &RootOverlay) -> std::io::Result<()> {
         libc::chdir(c"/".as_ptr());
         libc::umount2(c"/oldroot".as_ptr(), libc::MNT_DETACH);
         libc::rmdir(c"/oldroot".as_ptr());
-        // Run the test from its (now ephemeral) invocation directory.
+        // Land in the (now ephemeral) invocation directory; the runner script
+        // then cds into the per-test working directory.
         if libc::chdir(p.chdir_to.as_ptr()) != 0 {
             return fail();
         }

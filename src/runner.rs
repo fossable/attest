@@ -152,10 +152,11 @@ impl PendingTest {
 
 impl Drop for PendingTest {
     fn drop(&mut self) {
-        if let Ok(None) = self.child.try_wait() {
-            self.kill_tree();
-            let _ = self.child.wait();
-        }
+        // Always kill the tree: even when the main shell exited normally,
+        // background processes it spawned survive in its session/cgroup, and
+        // tests are promised they never need to clean those up themselves.
+        self.kill_tree();
+        let _ = self.child.wait();
         if let Some(ref dir) = self.context {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -542,6 +543,11 @@ fn spawn_test(
 ) -> Result<PendingTest> {
     std::fs::create_dir_all(&context)?;
 
+    // Fresh, empty working directory for the test. It lives in the context dir
+    // (live-bound inside isolated roots), so it works with and without overlay
+    // isolation and is picked up by --save-context.
+    std::fs::create_dir_all(cwd_dir(&context))?;
+
     // When overlay isolation is available, plan the per-test ephemeral root
     // (this also creates the overlay dirs under the context dir).
     let root_plan = match env.overlay_mode {
@@ -725,12 +731,25 @@ fn save_test_context(result: &TestResult, save_dir: &Path, submounts: &[overlay:
             );
         }
     }
+    // The per-test working directory is live-bound inside isolated roots (it
+    // is not part of any overlay upper layer), so copy it explicitly.
+    let cwd = cwd_dir(&result.context);
+    if dir_non_empty(&cwd) {
+        if let Err(e) = overlay::copy_dir_recursive(&cwd, &dst.join("cwd")) {
+            warn!("failed to save cwd for {}: {e}", result.name);
+        }
+    }
     for log in ["stdout.log", "xtrace.log"] {
         let src = result.context.join(log);
         if src.exists() {
             let _ = std::fs::copy(&src, dst.join(log));
         }
     }
+}
+
+/// The clean per-test working directory inside a context dir.
+pub fn cwd_dir(context: &Path) -> PathBuf {
+    context.join("cwd")
 }
 
 /// Quote a path for literal inclusion in generated sh scripts: single-quoted,
@@ -776,6 +795,9 @@ fn build_runner_script(
         sh_quote(&xtrace)
     ));
     s.push_str("set -e\n");
+
+    // Every test starts in its own clean, empty working directory.
+    s.push_str(&format!("cd {}\n", sh_quote(&cwd_dir(working_dir))));
 
     // Source function definitions, then enable xtrace and invoke the test function.
     s.push_str(&format!(". {}\n", sh_quote(functions_path)));
@@ -896,6 +918,41 @@ mod tests {
             "get_value() {\n  echo 42\n}\ntest_helper() {\n  val=$(get_value)\n  test \"$val\" = \"42\"\n}\n",
             "test_helper",
         ).passed);
+    }
+
+    #[test]
+    fn test_starts_in_clean_cwd() {
+        let r = run_inline(
+            "test_cwd() {\n  test -z \"$(ls -A .)\"\n  echo data > f.txt\n}\n",
+            "test_cwd",
+        );
+        assert!(r.passed);
+        assert!(cwd_dir(&r.context).join("f.txt").exists());
+    }
+
+    #[test]
+    fn background_process_killed_after_normal_exit() {
+        let r = run_inline(
+            "test_bg() {\n  sleep 300 &\n  echo $! > pid\n}\n",
+            "test_bg",
+        );
+        assert!(r.passed);
+        let pid: u32 = fs::read_to_string(cwd_dir(&r.context).join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The straggler must be dead shortly after the test completes. It may
+        // linger as a zombie when nothing reaps reparented children (e.g. in
+        // minimal containers), which still counts as killed.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match process_state(pid) {
+                None | Some('Z') => break,
+                _ if Instant::now() > deadline => panic!("background process survived the test"),
+                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
     }
 
     #[test]
