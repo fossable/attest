@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::output::{GREEN, RED, RESET};
 use crate::runner::TestResult;
 
 /// Information extracted from an xtrace log about the failing command.
@@ -261,10 +262,14 @@ fn render_bracket_diff(expr: &BracketExpr) {
                     right_hl.push_str(val);
                 }
                 ChangeTag::Delete => {
-                    left_hl.push_str(&format!("\x1b[31m{val}\x1b[0m"));
+                    left_hl.push_str(RED);
+                    left_hl.push_str(val);
+                    left_hl.push_str(RESET);
                 }
                 ChangeTag::Insert => {
-                    right_hl.push_str(&format!("\x1b[32m{val}\x1b[0m"));
+                    right_hl.push_str(GREEN);
+                    right_hl.push_str(val);
+                    right_hl.push_str(RESET);
                 }
             }
         }

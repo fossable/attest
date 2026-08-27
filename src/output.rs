@@ -5,9 +5,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use crate::parser::TestCase;
 use crate::runner::TestResult;
 
-const GREEN: &str = "\x1b[32m";
-const RED: &str = "\x1b[31m";
-const RESET: &str = "\x1b[0m";
+pub(crate) const GREEN: &str = "\x1b[32m";
+pub(crate) const RED: &str = "\x1b[31m";
+pub(crate) const RESET: &str = "\x1b[0m";
 
 pub struct StatusDisplay {
     bar: Option<ProgressBar>,
