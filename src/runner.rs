@@ -366,15 +366,13 @@ pub fn run_all_tests(
         // process — never both.
         if let Some(fuzz_level) = config.fuzz {
             for pending in pending_list.iter_mut() {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
+                let roll = xorshift64(&mut rng);
                 let test_pid = pending.child.id();
                 let descendants: Vec<u32> = collect_descendants(test_pid)
                     .into_iter()
                     .filter(|&pid| pid != test_pid)
                     .collect();
-                if (rng as f64) / (u64::MAX as f64) >= fuzz_level {
+                if (roll as f64) / (u64::MAX as f64) >= fuzz_level {
                     // Resume a random stopped descendant.
                     let stopped: Vec<u32> = descendants
                         .iter()
@@ -382,10 +380,7 @@ pub fn run_all_tests(
                         .filter(|&pid| process_state(pid) == Some('T'))
                         .collect();
                     if !stopped.is_empty() {
-                        rng ^= rng << 13;
-                        rng ^= rng >> 7;
-                        rng ^= rng << 17;
-                        let chosen = stopped[(rng as usize) % stopped.len()];
+                        let chosen = stopped[(xorshift64(&mut rng) as usize) % stopped.len()];
                         if unsafe { libc::kill(chosen as libc::pid_t, libc::SIGCONT) } == 0 {
                             trace!(pid = chosen, "Resumed subprocess");
                         }
@@ -398,10 +393,7 @@ pub fn run_all_tests(
                         .filter(|&pid| process_state(pid) != Some('T'))
                         .collect();
                     if !running.is_empty() {
-                        rng ^= rng << 13;
-                        rng ^= rng >> 7;
-                        rng ^= rng << 17;
-                        let chosen = running[(rng as usize) % running.len()];
+                        let chosen = running[(xorshift64(&mut rng) as usize) % running.len()];
                         if unsafe { libc::kill(chosen as libc::pid_t, libc::SIGSTOP) } == 0 {
                             trace!(pid = chosen, "Paused subprocess");
                         }
@@ -811,6 +803,15 @@ fn build_runner_script(
 
 /// Collect the PID of `root` and all of its descendants by walking
 /// `/proc/<pid>/task/<pid>/children` recursively.
+/// Advance an xorshift64 PRNG state in place and return the new value. Used by
+/// the `--fuzz` scheduler to pick which descendant to pause or resume.
+fn xorshift64(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
 fn collect_descendants(root: u32) -> Vec<u32> {
     let mut result = vec![root];
     let mut queue = vec![root];
