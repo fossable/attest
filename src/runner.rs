@@ -801,8 +801,6 @@ fn build_runner_script(
     s
 }
 
-/// Collect the PID of `root` and all of its descendants by walking
-/// `/proc/<pid>/task/<pid>/children` recursively.
 /// Advance an xorshift64 PRNG state in place and return the new value. Used by
 /// the `--fuzz` scheduler to pick which descendant to pause or resume.
 fn xorshift64(state: &mut u64) -> u64 {
@@ -812,6 +810,8 @@ fn xorshift64(state: &mut u64) -> u64 {
     *state
 }
 
+/// Collect the PID of `root` and all of its descendants by walking
+/// `/proc/<pid>/task/<pid>/children` recursively.
 fn collect_descendants(root: u32) -> Vec<u32> {
     let mut result = vec![root];
     let mut queue = vec![root];
