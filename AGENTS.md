@@ -81,6 +81,18 @@ implicit assertion - if it exits nonzero, the test fails. Non-test functions
   `DIR/<test>/` for debugging
 - `--no-overlay` — disable overlayfs isolation; run each test directly in the
   working directory (same as the automatic fallback when overlays are unavailable)
+- `--repeat N` — run each test N times (default: 1); combine with `--fuzz` to
+  shake out flaky tests
+- `--fuzz [VALUE]` — randomly pause and resume each test's descendant processes
+  (`SIGSTOP`/`SIGCONT`) to introduce timing non-determinism. Optional
+  aggressiveness in (0,1); higher pauses more often (default: 0.5)
+- `--shebang SHELL` — force this shell for every test, ignoring each script's own
+  shebang (e.g. `/bin/bash`, `/usr/bin/zsh`)
+- `--json` — print results as JSONL (one JSON object per test) instead of the
+  colored terminal output
+- `--no-cgroups` — disable cgroup resource tracking (only present when built with
+  the `cgroup` feature)
+- `-d`, `--debug` — enable debug logging
 
 ## Building and running
 
