@@ -278,24 +278,28 @@ fn main() -> anyhow::Result<()> {
             let pattern = filter.as_deref().map(parser::TestPattern::parse);
             let files = discovery::discover_test_files(&path)?;
 
+            // Parse each file exactly once and keep the owning `TestFile`s
+            // alive, so every test can borrow its file's extracted functions
+            // rather than cloning the whole AST per test (and again per repeat).
+            let parsed = files
+                .iter()
+                .map(|file| parser::parse_test_file(file))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+
             // Collect matching tests, tallying how often each name occurs so
-            // duplicates across files can be given distinct display names.
-            let mut selected: Vec<(
-                String,
-                Vec<brush_parser::ast::FunctionDefinition>,
-                std::path::PathBuf,
-            )> = Vec::new();
+            // duplicates across files can be given distinct display names. Each
+            // selection records the index of the file it came from.
+            let mut selected: Vec<(String, usize)> = Vec::new();
             let mut name_counts: std::collections::HashMap<String, usize> = Default::default();
-            for file in &files {
-                let test_file = parser::parse_test_file(file)?;
-                for test in test_file.tests {
+            for (idx, test_file) in parsed.iter().enumerate() {
+                for test in &test_file.tests {
                     if let Some(ref p) = pattern
-                        && !p.matches(&test)
+                        && !p.matches(test)
                     {
                         continue;
                     }
                     *name_counts.entry(test.name.clone()).or_default() += 1;
-                    selected.push((test.name, test_file.functions.clone(), file.clone()));
+                    selected.push((test.name.clone(), idx));
                 }
             }
             if selected.is_empty() {
@@ -308,21 +312,16 @@ fn main() -> anyhow::Result<()> {
             // Display names key result output, per-test context dirs, and
             // --save-context dirs, so they must be unique per test.
             let mut taken = std::collections::HashSet::new();
-            let mut all_tests: Vec<(
-                String,
-                String,
-                Vec<brush_parser::ast::FunctionDefinition>,
-                std::path::PathBuf,
-            )> = Vec::new();
-            for (name, functions, file) in selected {
-                let base = display_base(&name, &file, name_counts[&name] > 1, &mut taken);
+            let mut all_tests: Vec<(String, String, usize)> = Vec::new();
+            for (name, idx) in selected {
+                let base = display_base(&name, &files[idx], name_counts[&name] > 1, &mut taken);
                 for i in 1..=cli.repeat {
                     let display = if cli.repeat > 1 {
                         format!("{base}#{i}")
                     } else {
                         base.clone()
                     };
-                    all_tests.push((display, name.clone(), functions.clone(), file.clone()));
+                    all_tests.push((display, name.clone(), idx));
                 }
             }
 
@@ -364,12 +363,12 @@ fn main() -> anyhow::Result<()> {
                 &std::path::Path,
             )> = all_tests
                 .iter()
-                .map(|(display, fn_name, funcs, src)| {
+                .map(|(display, fn_name, idx)| {
                     (
                         display.as_str(),
                         fn_name.as_str(),
-                        funcs.as_slice(),
-                        src.as_path(),
+                        parsed[*idx].functions.as_slice(),
+                        files[*idx].as_path(),
                     )
                 })
                 .collect();
