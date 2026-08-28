@@ -11,6 +11,9 @@ pub(crate) const RESET: &str = "\x1b[0m";
 
 pub struct StatusDisplay {
     bar: Option<ProgressBar>,
+    /// Pass/fail of each completed test, in completion order, used to draw the
+    /// green/red block strip in the live status line.
+    results: Vec<bool>,
 }
 
 impl StatusDisplay {
@@ -19,25 +22,65 @@ impl StatusDisplay {
             let bar = ProgressBar::new(total as u64);
             bar.set_style(
                 ProgressStyle::default_bar()
-                    .template("\x1b[1;32mTesting\x1b[0m {pos}/{len}: [{msg}]")
+                    .template("\x1b[1;32mTesting\x1b[0m {pos}/{len} {msg}")
                     .unwrap(),
             );
             bar.enable_steady_tick(Duration::from_millis(250));
-            Self { bar: Some(bar) }
+            Self {
+                bar: Some(bar),
+                results: Vec::new(),
+            }
         } else {
-            Self { bar: None }
+            Self {
+                bar: None,
+                results: Vec::new(),
+            }
         }
     }
 
-    /// Update the status line with currently running tests and their elapsed times.
+    /// Record a completed test's outcome so the progress strip can show a
+    /// green (pass) or red (fail) block for it.
+    pub fn record(&mut self, passed: bool) {
+        self.results.push(passed);
+        if let Some(ref bar) = self.bar {
+            bar.set_position(self.results.len() as u64);
+        }
+    }
+
+    /// Render the most recently completed tests as colored blocks — green for
+    /// a pass, red for a fail. Capped to the last `MAX_BLOCKS` so the strip
+    /// stays within a normal-width terminal even for large suites.
+    fn render_blocks(&self) -> String {
+        const MAX_BLOCKS: usize = 32;
+        if self.results.is_empty() {
+            return String::new();
+        }
+        let start = self.results.len().saturating_sub(MAX_BLOCKS);
+        let mut s = String::new();
+        for &passed in &self.results[start..] {
+            s.push_str(if passed { GREEN } else { RED });
+            s.push('█');
+        }
+        s.push_str(RESET);
+        s
+    }
+
+    /// Update the status line with the result strip plus the currently running
+    /// tests and their elapsed times.
     pub fn update(&self, running: &[(&str, Duration)], completed: usize) {
         if let Some(ref bar) = self.bar {
             bar.set_position(completed as u64);
-            let msg: String = running
+            let running_msg: String = running
                 .iter()
                 .map(|(name, elapsed)| format!("{}({})", name, format_duration(*elapsed)))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let blocks = self.render_blocks();
+            let msg = match (blocks.is_empty(), running_msg.is_empty()) {
+                (true, _) => running_msg,
+                (false, true) => blocks,
+                (false, false) => format!("{blocks}  {running_msg}"),
+            };
             bar.set_message(msg);
         }
     }
@@ -262,5 +305,40 @@ fn format_duration(d: Duration) -> String {
         format!("{:.0}ms", d.as_millis())
     } else {
         format!("{secs:.2}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn display_with(results: Vec<bool>) -> StatusDisplay {
+        StatusDisplay {
+            bar: None,
+            results,
+        }
+    }
+
+    #[test]
+    fn render_blocks_empty_is_blank() {
+        assert_eq!(display_with(vec![]).render_blocks(), "");
+    }
+
+    #[test]
+    fn render_blocks_colors_pass_and_fail() {
+        let s = display_with(vec![true, false]).render_blocks();
+        // One green block, one red block, then a reset.
+        assert_eq!(s, format!("{GREEN}█{RED}█{RESET}"));
+    }
+
+    #[test]
+    fn render_blocks_caps_to_most_recent() {
+        // 40 passes then a single fail: only the last 32 render, and the most
+        // recent (the fail) must be present.
+        let mut results = vec![true; 40];
+        results.push(false);
+        let s = display_with(results).render_blocks();
+        assert_eq!(s.matches('█').count(), 32);
+        assert!(s.contains(&format!("{RED}█")));
     }
 }

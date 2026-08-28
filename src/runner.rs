@@ -251,7 +251,7 @@ pub fn run_all_tests(
 ) -> Result<Vec<TestResult>> {
     let mut results = Vec::new();
     let total = tests.len();
-    let status = output::StatusDisplay::new(total, config.json);
+    let mut status = output::StatusDisplay::new(total, config.json);
     let wall_start = Instant::now();
 
     let max_parallel = config.parallel.max(1);
@@ -445,6 +445,7 @@ pub fn run_all_tests(
             if config.json {
                 output::print_test_result_json(&result);
             } else {
+                status.record(result.passed);
                 status.suspend(|| output::print_test_result(&result));
             }
             if !result.passed && config.bail {
