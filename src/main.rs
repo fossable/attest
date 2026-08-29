@@ -91,7 +91,7 @@ struct Cli {
     #[arg(long, num_args = 0..=1, default_missing_value = "0.5", value_parser = parse_fuzz)]
     fuzz: Option<f64>,
 
-    /// Run each test this many times (default: 1)
+    /// Run each test this many times
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     repeat: u64,
 
