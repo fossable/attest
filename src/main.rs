@@ -40,7 +40,7 @@ struct Cli {
     path: Option<String>,
 
     /// Maximum number of tests to run in parallel
-    #[arg(long, default_value_t = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))]
+    #[arg(long, default_value_t = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1), value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     parallel: usize,
 
     /// Filter tests by pattern: `[<file>/]<name>` where `<name>` supports `*` wildcards and
