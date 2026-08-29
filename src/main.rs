@@ -56,9 +56,10 @@ struct Cli {
     #[arg(long)]
     bail: bool,
 
-    /// Print xtrace output from tests as they run (one test at a time)
-    #[arg(short = 'x', long)]
-    xtrace: bool,
+    /// Increase output verbosity (-v: per-test PASS/FAIL lines, -vv: live
+    /// xtrace streaming, one test at a time)
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    verbose: u8,
 
     /// Override a command in the test context bin/ dir. Accepts a path
     /// (`/usr/bin/example` or `./bin/example`) or a mapping
@@ -342,7 +343,7 @@ fn main() -> anyhow::Result<()> {
             let config = runner::RunConfig {
                 parallel: cli.parallel,
                 bail: cli.bail,
-                xtrace: cli.xtrace,
+                verbose: cli.verbose,
                 json: cli.json,
                 save_context: cli.save_context,
                 override_cmds: cli.r#override,

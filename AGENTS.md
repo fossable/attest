@@ -74,7 +74,10 @@ implicit assertion - if it exits nonzero, the test fails. Non-test functions
   inherited PATH. Repeatable
 - `--strace CMD` — wrap CMD with strace, output saved to `strace/CMD.log` in the
   test context dir
-- `--xtrace` — stream xtrace output live (one test at a time)
+- `-v`, `--verbose` — increase verbosity (repeatable). By default only the
+  progress bar is shown, plus a FAIL line with the test's xtrace output and a
+  diagnostic snippet for each failure; `-v` adds per-test PASS/FAIL lines;
+  `-vv` also streams xtrace output live (one test at a time)
 - `--save-context DIR` — for each test, copy the files it created/modified
   (all overlay upper layers merged, laid out by absolute path: a write to
   `/tmp/x` appears at `DIR/<test>/tmp/x`) plus `stdout.log`/`xtrace.log` to
@@ -100,5 +103,4 @@ Use `cargo run --` to execute the project.
 
 ## TODOs
 
-- Improve non-json terminal output
-  - Render a progressbar that turns a block either green or red instead of "PASS"/"FAIL"
+- make sure xtrace line numbers match source code

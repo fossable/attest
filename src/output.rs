@@ -234,9 +234,6 @@ pub fn print_test_result(result: &TestResult) {
     if let Some(ref r) = result.resources {
         print_resource_stats(r);
     }
-    if !result.passed {
-        crate::diagnostics::print_failure_snippet(result);
-    }
 }
 
 #[cfg(feature = "cgroup")]

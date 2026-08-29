@@ -98,15 +98,20 @@ impl XtraceStreamer {
         if self.is_holder(&pending.name) {
             return; // Will be flushed via release()
         }
-        let xtrace_path = pending.context.as_ref().unwrap().join("xtrace.log");
-        if let Ok(content) = std::fs::read(&xtrace_path)
-            && !content.is_empty()
-        {
-            eprintln!("\x1b[2m--- xtrace: {} ---\x1b[0m", pending.name);
-            let _ = write!(std::io::stderr(), "\x1b[2m");
-            let _ = std::io::stderr().write_all(&content);
-            let _ = write!(std::io::stderr(), "\x1b[0m");
-        }
+        dump_xtrace_log(&pending.name, pending.context.as_ref().unwrap());
+    }
+}
+
+/// Print a test's full xtrace.log, dimmed, under a `--- xtrace: <name> ---`
+/// header. Silent if the log is missing or empty.
+fn dump_xtrace_log(name: &str, context: &Path) {
+    if let Ok(content) = std::fs::read(context.join("xtrace.log"))
+        && !content.is_empty()
+    {
+        eprintln!("\x1b[2m--- xtrace: {name} ---\x1b[0m");
+        let _ = write!(std::io::stderr(), "\x1b[2m");
+        let _ = std::io::stderr().write_all(&content);
+        let _ = write!(std::io::stderr(), "\x1b[0m");
     }
 }
 
@@ -212,7 +217,9 @@ impl std::str::FromStr for OverrideSpec {
 pub struct RunConfig {
     pub parallel: usize,
     pub bail: bool,
-    pub xtrace: bool,
+    /// Output verbosity: 0 prints only failures, 1 adds per-test PASS/FAIL
+    /// lines, 2+ adds live xtrace streaming.
+    pub verbose: u8,
     pub json: bool,
     /// When set, each test's context directory is created here and left on exit.
     /// When unset, context dirs are temporary and cleaned up automatically.
@@ -262,7 +269,7 @@ pub fn run_all_tests(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0xdeadbeef_cafebabe);
-    let mut xtrace = if config.xtrace {
+    let mut xtrace = if config.verbose >= 2 {
         Some(XtraceStreamer::new())
     } else {
         None
@@ -446,7 +453,16 @@ pub fn run_all_tests(
                 output::print_test_result_json(&result);
             } else {
                 status.record(result.passed);
-                status.suspend(|| output::print_test_result(&result));
+                if config.verbose >= 1 || !result.passed {
+                    status.suspend(|| output::print_test_result(&result));
+                }
+                if !result.passed {
+                    // At -vv the streamer already showed this test's xtrace.
+                    if config.verbose < 2 {
+                        status.suspend(|| dump_xtrace_log(&result.name, &result.context));
+                    }
+                    status.suspend(|| crate::diagnostics::print_failure_snippet(&result));
+                }
             }
             if !result.passed && config.bail {
                 bail_flag = true;

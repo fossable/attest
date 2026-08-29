@@ -374,7 +374,8 @@ This directory contains, per test, its xtrace and stdout logs plus every file
 the test created or modified, laid out by absolute path (a write to `/tmp/x`
 shows up at `results/<test>/tmp/x`).
 
-You can also just view the xtrace output with the `--xtrace` flag:
+Failed tests always print their xtrace output. You can also stream the xtrace
+output live with the `-vv` flag:
 
 ![](./.github/assets/xtrace.gif)
 
