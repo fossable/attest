@@ -81,17 +81,19 @@ impl TestCgroup {
     /// Read total CPU time (user + system) from the cgroup. Returns `None`
     /// when the cpu controller is unavailable.
     pub fn read_cpu_time(&self) -> Option<std::time::Duration> {
-        let user = read_stat_field(self.path.join("cpu.stat"), "user_usec")?;
-        let system = read_stat_field(self.path.join("cpu.stat"), "system_usec").unwrap_or(0);
-        Some(std::time::Duration::from_micros(user + system))
+        let (user, system) = read_cpu_usec(self.path.join("cpu.stat"));
+        Some(std::time::Duration::from_micros(
+            user? + system.unwrap_or(0),
+        ))
     }
 
     /// Read resource stats from the cgroup pseudo-files. Call this after the
     /// child has exited (waitpid returned) but before dropping the handle.
     pub fn read_stats(&self) -> ResourceStats {
+        let (cpu_user_usec, cpu_system_usec) = read_cpu_usec(self.path.join("cpu.stat"));
         ResourceStats {
-            cpu_user_usec: read_stat_field(self.path.join("cpu.stat"), "user_usec"),
-            cpu_system_usec: read_stat_field(self.path.join("cpu.stat"), "system_usec"),
+            cpu_user_usec,
+            cpu_system_usec,
             memory_peak: read_single_u64(self.path.join("memory.peak")).or_else(|| {
                 trace!("memory.peak unavailable, falling back to memory.current");
                 read_single_u64(self.path.join("memory.current"))
@@ -343,17 +345,25 @@ fn read_single_u64(path: impl AsRef<std::path::Path>) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Parse a `key value` line from a stat file (e.g. `cpu.stat`).
-fn read_stat_field(path: impl AsRef<std::path::Path>, field: &str) -> Option<u64> {
-    let content = std::fs::read_to_string(path).ok()?;
-    content.lines().find_map(|line| {
-        let (k, v) = line.split_once(' ')?;
-        if k == field {
-            v.trim().parse().ok()
-        } else {
-            None
+/// Parse `user_usec` and `system_usec` from `cpu.stat` in a single read.
+/// Each field is `None` when the file is absent or the field is missing.
+fn read_cpu_usec(path: impl AsRef<std::path::Path>) -> (Option<u64>, Option<u64>) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
+    let mut user = None;
+    let mut system = None;
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        match key {
+            "user_usec" => user = value.trim().parse().ok(),
+            "system_usec" => system = value.trim().parse().ok(),
+            _ => {}
         }
-    })
+    }
+    (user, system)
 }
 
 /// Sum a named field (e.g. `rbytes`) across all device lines in `io.stat`.
