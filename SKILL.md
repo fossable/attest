@@ -57,8 +57,8 @@ testHeading() {
 # String inequality
 [ "$output" != "unexpected" ]
 
-# String match
-[[ "$output" ~= "^[0-9]$" ]]
+# String match (regex; leave the pattern unquoted so it is not matched literally)
+[[ "$output" =~ ^[0-9]$ ]]
 
 # File exists
 [ -f path/to/file ]
