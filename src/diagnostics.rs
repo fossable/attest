@@ -216,21 +216,25 @@ fn render_snippet(
     println!("{}", renderer.render(report));
 }
 
-/// Parse a `[` test command from xtrace output.
+/// Parse a `[` or `[[` test command from xtrace output.
 ///
-/// Xtrace renders `[ "A" = "B" ]` as `'[' A = B ']'`.
+/// Xtrace renders `[ "A" = "B" ]` as `'[' A = B ']'` and
+/// `[[ "A" = "B" ]]` as `[[ A == B ]]` (bash spells `=` as `==` inside `[[`).
 fn parse_bracket_expr(command: &str) -> Option<BracketExpr> {
-    let inner = command.strip_prefix("'[' ")?.strip_suffix(" ']'")?;
+    let inner = command
+        .strip_prefix("'[' ")
+        .and_then(|s| s.strip_suffix(" ']'"))
+        .or_else(|| command.strip_prefix("[[ ").and_then(|s| s.strip_suffix(" ]]")))?;
     let parts: Vec<&str> = inner.splitn(3, ' ').collect();
     if parts.len() != 3 {
         return None;
     }
 
     let op = parts[1];
-    // Only handle comparison operators
+    // Only handle comparison operators (`==` is how `[[` spells `=`).
     if !matches!(
         op,
-        "=" | "!=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
+        "=" | "==" | "!=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
     ) {
         return None;
     }
@@ -249,7 +253,7 @@ fn render_bracket_diff(expr: &BracketExpr) {
     println!(" right: \"{}\"", expr.right);
 
     // For equality operators, show inline diff if values differ
-    if matches!(expr.op.as_str(), "=" | "!=") && expr.left != expr.right {
+    if matches!(expr.op.as_str(), "=" | "==" | "!=") && expr.left != expr.right {
         use similar::{ChangeTag, TextDiff};
         let diff = TextDiff::from_chars(&expr.left, &expr.right);
         let mut left_hl = String::new();
@@ -304,6 +308,23 @@ mod tests {
         assert_eq!(expr.left, "1");
         assert_eq!(expr.op, "-eq");
         assert_eq!(expr.right, "2");
+    }
+
+    #[test]
+    fn parse_double_bracket_equality() {
+        // `[[ "A" = "B" ]]` is rendered by bash xtrace as `[[ A == B ]]`.
+        let expr = parse_bracket_expr("[[ ABC == DEF ]]").unwrap();
+        assert_eq!(expr.left, "ABC");
+        assert_eq!(expr.op, "==");
+        assert_eq!(expr.right, "DEF");
+    }
+
+    #[test]
+    fn parse_double_bracket_inequality() {
+        let expr = parse_bracket_expr("[[ foo != bar ]]").unwrap();
+        assert_eq!(expr.left, "foo");
+        assert_eq!(expr.op, "!=");
+        assert_eq!(expr.right, "bar");
     }
 
     #[test]
