@@ -779,20 +779,18 @@ fn build_runner_script(
 ) -> String {
     let mut s = String::new();
 
-    // Extra bin dirs (e.g. build-cache output dirs) go first so they sit below the
-    // context bin/ (--override wins) but above the inherited PATH.
-    for dir in bin_dirs {
-        s.push_str(&format!("export PATH={}:\"$PATH\"\n", sh_quote(dir)));
-    }
-
-    // bin/ is next so --override binaries take precedence over --bin-dir.
-    let bin_dir = working_dir.join("bin");
-    s.push_str(&format!("export PATH={}:\"$PATH\"\n", sh_quote(&bin_dir)));
-
-    // Strace wrappers dir must precede bin/ so wrappers intercept calls.
+    // PATH entries prepended low-to-high precedence, each layering on top of the
+    // previous, so the last one wins:
+    //   --bin-dir dirs  — below the context bin/ (--override wins) but above the inherited PATH
+    //   context bin/    — --override binaries take precedence over --bin-dir
+    //   strace_bin/     — wrappers must precede bin/ so they intercept calls
+    let mut path_dirs: Vec<PathBuf> = bin_dirs.to_vec();
+    path_dirs.push(working_dir.join("bin"));
     if !strace.is_empty() {
-        let strace_bin = working_dir.join("strace_bin");
-        s.push_str(&format!("export PATH={}:\"$PATH\"\n", sh_quote(&strace_bin)));
+        path_dirs.push(working_dir.join("strace_bin"));
+    }
+    for dir in &path_dirs {
+        s.push_str(&format!("export PATH={}:\"$PATH\"\n", sh_quote(dir)));
     }
 
     // Redirect both stdout and stderr to log files, then enable xtrace.
