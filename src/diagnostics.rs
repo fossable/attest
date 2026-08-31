@@ -43,10 +43,19 @@ pub fn print_failure_snippet(result: &TestResult) {
         return;
     };
 
+    // A timed-out test did not fail a command; the highlighted line is simply
+    // where it was still running when the clock ran out.
+    let title = if result.timed_out {
+        "test timed out"
+    } else {
+        "command failed"
+    };
+
     if let Some(match_info) =
         find_line_in_source(&original_source, &result.name, failing_line_trimmed)
     {
         render_snippet(
+            title,
             &result.source_path,
             &original_source,
             match_info.byte_start,
@@ -167,6 +176,7 @@ fn find_line_in_source(source: &str, function_name: &str, needle: &str) -> Optio
 /// Render an annotate-snippets diagnostic for the failing line with surrounding context,
 /// clamped to the enclosing function boundaries.
 fn render_snippet(
+    title: &str,
     source_path: &Path,
     source: &str,
     byte_start: usize,
@@ -204,7 +214,7 @@ fn render_snippet(
     let adj_start = byte_start - window_byte_start;
     let adj_end = byte_end - window_byte_start;
 
-    let report = &[Level::ERROR.primary_title("command failed").element(
+    let report = &[Level::ERROR.primary_title(title).element(
         Snippet::source(&window_source)
             .path(&*path_str)
             .line_start(window_start + 1)
