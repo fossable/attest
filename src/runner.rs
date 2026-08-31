@@ -777,6 +777,8 @@ fn build_runner_script(
     bin_dirs: &[PathBuf],
     strace: &[String],
 ) -> String {
+    use std::fmt::Write;
+
     let mut s = String::new();
 
     // PATH entries prepended low-to-high precedence, each layering on top of the
@@ -790,24 +792,20 @@ fn build_runner_script(
         path_dirs.push(working_dir.join("strace_bin"));
     }
     for dir in &path_dirs {
-        s.push_str(&format!("export PATH={}:\"$PATH\"\n", sh_quote(dir)));
+        let _ = writeln!(s, "export PATH={}:\"$PATH\"", sh_quote(dir));
     }
 
     // Redirect both stdout and stderr to log files, then enable xtrace.
     let stdout = working_dir.join("stdout.log");
     let xtrace = working_dir.join("xtrace.log");
-    s.push_str(&format!(
-        "exec 1>{} 2>{}\n",
-        sh_quote(&stdout),
-        sh_quote(&xtrace)
-    ));
+    let _ = writeln!(s, "exec 1>{} 2>{}", sh_quote(&stdout), sh_quote(&xtrace));
     s.push_str("set -e\n");
 
     // Every test starts in its own clean, empty working directory.
-    s.push_str(&format!("cd {}\n", sh_quote(&cwd_dir(working_dir))));
+    let _ = writeln!(s, "cd {}", sh_quote(&cwd_dir(working_dir)));
 
     // Source function definitions, then enable xtrace and invoke the test function.
-    s.push_str(&format!(". {}\n", sh_quote(functions_path)));
+    let _ = writeln!(s, ". {}", sh_quote(functions_path));
     s.push_str("PS4='+$LINENO: '\n");
     s.push_str("set -x\n");
     s.push_str(test_name);
