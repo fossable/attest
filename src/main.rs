@@ -25,6 +25,20 @@ fn parse_fuzz(s: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_timeout(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid number", s))?;
+    if v.is_finite() && v > 0.0 {
+        Ok(v)
+    } else {
+        Err(format!(
+            "timeout must be a positive number of seconds, got {}",
+            v
+        ))
+    }
+}
+
 #[derive(Parser)]
 #[command(
     version,
@@ -78,7 +92,7 @@ struct Cli {
     strace: Vec<String>,
 
     /// Kill a test and mark it as timed out after this many seconds (wall-clock time)
-    #[arg(long)]
+    #[arg(long, value_parser = parse_timeout)]
     timeout: Option<f64>,
 
     /// Print results as JSONL (one JSON object per test) instead of terminal output
