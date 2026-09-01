@@ -527,15 +527,22 @@ pub fn run_all_tests(
 
 /// Resolve a shell name or path to an executable, falling back to `/bin/sh`
 /// when the requested shell is not found.
-fn resolve_shell(shell: &str) -> String {
+/// Whether `shell` names something we can exec: an existing path when it
+/// contains a `/`, or a command resolvable on `PATH` otherwise.
+pub(crate) fn shell_exists(shell: &str) -> bool {
     if shell.contains('/') {
-        if std::path::Path::new(shell).exists() {
-            return shell.to_string();
-        }
-    } else if which::which(shell).is_ok() {
-        return shell.to_string();
+        std::path::Path::new(shell).exists()
+    } else {
+        which::which(shell).is_ok()
     }
-    "/bin/sh".to_string()
+}
+
+fn resolve_shell(shell: &str) -> String {
+    if shell_exists(shell) {
+        shell.to_string()
+    } else {
+        "/bin/sh".to_string()
+    }
 }
 
 /// Spawn a child process that will run the test. Returns a `PendingTest` that
@@ -914,6 +921,22 @@ mod tests {
         )
         .unwrap();
         wait_and_collect(pending)
+    }
+
+    #[test]
+    fn shell_exists_detects_real_and_missing_shells() {
+        // Absolute path that exists vs. one that doesn't.
+        assert!(shell_exists("/bin/sh"));
+        assert!(!shell_exists("/no/such/shell"));
+        // Bare name resolved via PATH.
+        assert!(shell_exists("sh"));
+        assert!(!shell_exists("definitely-not-a-real-shell-xyz"));
+    }
+
+    #[test]
+    fn resolve_shell_falls_back_when_missing() {
+        assert_eq!(resolve_shell("/bin/sh"), "/bin/sh");
+        assert_eq!(resolve_shell("/no/such/shell"), "/bin/sh");
     }
 
     #[test]
