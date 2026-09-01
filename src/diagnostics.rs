@@ -38,6 +38,17 @@ pub fn print_failure_snippet(result: &TestResult) {
     // Normalize by stripping trailing `;` for matching against original source.
     let failing_line_trimmed = failing_line.trim().trim_end_matches(';');
 
+    // A command can appear more than once in a test (e.g. an assertion repeated
+    // after mutating state). The line text alone is ambiguous, so count how many
+    // earlier lines in the reconstructed function share it: that rank picks out
+    // the matching occurrence in the original source instead of always the first.
+    let occurrence = occurrence_in_reconstructed(
+        &functions_source,
+        &result.name,
+        failing_line_trimmed,
+        failure.lineno,
+    );
+
     // Read original source and find the matching line
     let Ok(original_source) = std::fs::read_to_string(&result.source_path) else {
         return;
@@ -51,9 +62,12 @@ pub fn print_failure_snippet(result: &TestResult) {
         "command failed"
     };
 
-    if let Some(match_info) =
-        find_line_in_source(&original_source, &result.name, failing_line_trimmed)
-    {
+    if let Some(match_info) = find_line_in_source(
+        &original_source,
+        &result.name,
+        failing_line_trimmed,
+        occurrence,
+    ) {
         render_snippet(
             title,
             &result.source_path,
@@ -107,11 +121,68 @@ struct SourceMatch {
     func_end_line: usize,
 }
 
-/// Find a line matching `needle` inside the named function in the original source.
-fn find_line_in_source(source: &str, function_name: &str, needle: &str) -> Option<SourceMatch> {
+/// Count how many earlier lines in `function_name`'s body (within the
+/// reconstructed functions.sh) share the failing command's text. The result is
+/// the 0-based rank of the occurrence at `target_lineno`, used to disambiguate a
+/// command that appears more than once when mapping back to the original source.
+fn occurrence_in_reconstructed(
+    functions_src: &str,
+    function_name: &str,
+    needle: &str,
+    target_lineno: usize,
+) -> usize {
+    let mut in_function = false;
+    let mut brace_depth: i32 = 0;
+    let mut rank = 0usize;
+
+    for (line_idx, line) in functions_src.lines().enumerate() {
+        let trimmed = line.trim();
+
+        if !in_function {
+            if trimmed.starts_with(function_name)
+                && trimmed[function_name.len()..].trim_start().starts_with('(')
+            {
+                in_function = true;
+                brace_depth += trimmed.matches('{').count() as i32;
+                brace_depth -= trimmed.matches('}').count() as i32;
+            }
+            continue;
+        }
+
+        brace_depth += trimmed.matches('{').count() as i32;
+        brace_depth -= trimmed.matches('}').count() as i32;
+
+        // Stop once we reach the failing line (1-based); count only lines before it.
+        if line_idx + 1 >= target_lineno {
+            break;
+        }
+        if trimmed.trim_end_matches(';') == needle {
+            rank += 1;
+        }
+        // Left the function before reaching the target: a same-named block is not
+        // possible (function names are unique), so restart the count defensively.
+        if brace_depth <= 0 {
+            in_function = false;
+            rank = 0;
+        }
+    }
+
+    rank
+}
+
+/// Find the line matching `needle` inside the named function in the original
+/// source. `occurrence` selects which match to return when the text repeats
+/// (0 = first), so a failure on a later duplicate highlights the right line.
+fn find_line_in_source(
+    source: &str,
+    function_name: &str,
+    needle: &str,
+    occurrence: usize,
+) -> Option<SourceMatch> {
     let mut in_function = false;
     let mut brace_depth: i32 = 0;
     let mut func_start_line: usize = 0;
+    let mut matches_seen: usize = 0;
 
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim();
@@ -132,6 +203,14 @@ fn find_line_in_source(source: &str, function_name: &str, needle: &str) -> Optio
             brace_depth -= trimmed.matches('}').count() as i32;
 
             if trimmed.trim_end_matches(';') == needle {
+                // Skip earlier duplicates until we reach the failing occurrence.
+                if matches_seen < occurrence {
+                    matches_seen += 1;
+                    if brace_depth <= 0 {
+                        in_function = false;
+                    }
+                    continue;
+                }
                 // Calculate byte offsets in source
                 let byte_start = source
                     .lines()
@@ -234,7 +313,11 @@ fn parse_bracket_expr(command: &str) -> Option<BracketExpr> {
     let inner = command
         .strip_prefix("'[' ")
         .and_then(|s| s.strip_suffix(" ']'"))
-        .or_else(|| command.strip_prefix("[[ ").and_then(|s| s.strip_suffix(" ]]")))?;
+        .or_else(|| {
+            command
+                .strip_prefix("[[ ")
+                .and_then(|s| s.strip_suffix(" ]]"))
+        })?;
     let parts: Vec<&str> = inner.splitn(3, ' ').collect();
     if parts.len() != 3 {
         return None;
@@ -372,7 +455,7 @@ mod tests {
     fn find_line_in_function() {
         let source =
             "helper() {\n  echo setup\n}\n\ntest_foo() {\n  echo hello\n  [ ABC = DEF ]\n}\n";
-        let m = find_line_in_source(source, "test_foo", "[ ABC = DEF ]").unwrap();
+        let m = find_line_in_source(source, "test_foo", "[ ABC = DEF ]", 0).unwrap();
         assert_eq!(&source[m.byte_start..m.byte_end], "[ ABC = DEF ]");
         assert_eq!(m.func_start_line, 4); // 0-based: "test_foo() {"
         assert_eq!(m.func_end_line, 7); // 0-based: "}"
@@ -381,6 +464,46 @@ mod tests {
     #[test]
     fn find_line_not_in_wrong_function() {
         let source = "test_a() {\n  echo hello\n}\n\ntest_b() {\n  echo world\n}\n";
-        assert!(find_line_in_source(source, "test_b", "echo hello").is_none());
+        assert!(find_line_in_source(source, "test_b", "echo hello", 0).is_none());
+    }
+
+    #[test]
+    fn find_line_selects_requested_occurrence() {
+        // The same command on two lines; occurrence picks which one to highlight.
+        let source = "test_dup() {\n  test -f m\n  rm m\n  test -f m\n}\n";
+        let first = find_line_in_source(source, "test_dup", "test -f m", 0).unwrap();
+        // Second occurrence must map to a later byte offset than the first.
+        let second = find_line_in_source(source, "test_dup", "test -f m", 1).unwrap();
+        assert!(second.byte_start > first.byte_start);
+        assert_eq!(&source[second.byte_start..second.byte_end], "test -f m");
+        // Only two occurrences exist, so a third request finds nothing.
+        assert!(find_line_in_source(source, "test_dup", "test -f m", 2).is_none());
+    }
+
+    #[test]
+    fn occurrence_rank_counts_earlier_duplicates() {
+        // Reconstructed functions.sh as brush renders it: `name ()`, brace on its
+        // own line, one `;`-terminated command per body line.
+        let functions_src = "test_dup () \n{ \n    test -f m;\n    rm m;\n    test -f m\n}\n";
+        // Line 3 is the first `test -f m` (rank 0), line 5 is the second (rank 1).
+        assert_eq!(
+            occurrence_in_reconstructed(functions_src, "test_dup", "test -f m", 3),
+            0
+        );
+        assert_eq!(
+            occurrence_in_reconstructed(functions_src, "test_dup", "test -f m", 5),
+            1
+        );
+    }
+
+    #[test]
+    fn occurrence_rank_ignores_other_functions() {
+        // An identical command in an earlier function must not inflate the rank.
+        let functions_src =
+            "helper () \n{ \n    test -f m\n}\ntest_dup () \n{ \n    test -f m\n}\n";
+        assert_eq!(
+            occurrence_in_reconstructed(functions_src, "test_dup", "test -f m", 7),
+            0
+        );
     }
 }
